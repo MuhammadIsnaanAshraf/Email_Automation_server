@@ -1,9 +1,6 @@
 -- ─────────────────────────────────────────────────────────────
--- FlowState — Module 1: Authentication schema (Supabase Auth)
--- Run this in the Supabase SQL editor (or via the CLI) once.
---
--- We use Supabase Auth's built-in auth.users table for user identity.
--- The backend validates Supabase JWT tokens directly via the Auth API.
+-- Migration: 20240101000000_initial_schema.sql
+-- FlowState — Module 1-3: Core Tables (Auth, Lists, Templates, Campaigns)
 -- ─────────────────────────────────────────────────────────────
 
 create extension if not exists "pgcrypto";
@@ -24,9 +21,6 @@ create table if not exists public.google_connections (
   connected_at   timestamptz not null default now(),
   updated_at     timestamptz not null default now()
 );
-
--- ── Sessions ─────────────────────────────────────────────────
--- Supabase Auth handles sessions via JWT tokens. No custom sessions table needed.
 
 -- ── Recipient lists ──────────────────────────────────────────
 create table if not exists public.recipient_lists (
@@ -138,3 +132,97 @@ alter table public.templates enable row level security;
 alter table public.campaigns enable row level security;
 alter table public.campaign_recipients enable row level security;
 alter table public.system_logs enable row level security;
+
+-- ── RLS Policies ─────────────────────────────────────────────
+
+-- google_connections
+create policy "Users can view own connections" on public.google_connections
+  for select using (user_id = auth.uid());
+
+create policy "Users can insert own connections" on public.google_connections
+  for insert with check (user_id = auth.uid());
+
+create policy "Users can update own connections" on public.google_connections
+  for update using (user_id = auth.uid());
+
+-- recipient_lists
+create policy "Users can view own lists" on public.recipient_lists
+  for select using (user_id = auth.uid());
+
+create policy "Users can insert own lists" on public.recipient_lists
+  for insert with check (user_id = auth.uid());
+
+create policy "Users can update own lists" on public.recipient_lists
+  for update using (user_id = auth.uid());
+
+create policy "Users can delete own lists" on public.recipient_lists
+  for delete using (user_id = auth.uid());
+
+-- recipients
+create policy "Users can view own recipients" on public.recipients
+  for select using (
+    exists (select 1 from public.recipient_lists l where l.id = list_id and l.user_id = auth.uid())
+  );
+
+create policy "Users can insert own recipients" on public.recipients
+  for insert with check (
+    exists (select 1 from public.recipient_lists l where l.id = list_id and l.user_id = auth.uid())
+  );
+
+create policy "Users can update own recipients" on public.recipients
+  for update using (
+    exists (select 1 from public.recipient_lists l where l.id = list_id and l.user_id = auth.uid())
+  );
+
+create policy "Users can delete own recipients" on public.recipients
+  for delete using (
+    exists (select 1 from public.recipient_lists l where l.id = list_id and l.user_id = auth.uid())
+  );
+
+-- templates
+create policy "Users can view own templates" on public.templates
+  for select using (user_id = auth.uid());
+
+create policy "Users can insert own templates" on public.templates
+  for insert with check (user_id = auth.uid());
+
+create policy "Users can update own templates" on public.templates
+  for update using (user_id = auth.uid());
+
+create policy "Users can delete own templates" on public.templates
+  for delete using (user_id = auth.uid());
+
+-- campaigns
+create policy "Users can view own campaigns" on public.campaigns
+  for select using (user_id = auth.uid());
+
+create policy "Users can insert own campaigns" on public.campaigns
+  for insert with check (user_id = auth.uid());
+
+create policy "Users can update own campaigns" on public.campaigns
+  for update using (user_id = auth.uid());
+
+create policy "Users can delete own campaigns" on public.campaigns
+  for delete using (user_id = auth.uid());
+
+-- campaign_recipients
+create policy "Users can view own campaign recipients" on public.campaign_recipients
+  for select using (
+    exists (select 1 from public.campaigns c where c.id = campaign_id and c.user_id = auth.uid())
+  );
+
+create policy "Users can insert own campaign recipients" on public.campaign_recipients
+  for insert with check (
+    exists (select 1 from public.campaigns c where c.id = campaign_id and c.user_id = auth.uid())
+  );
+
+create policy "Users can update own campaign recipients" on public.campaign_recipients
+  for update using (
+    exists (select 1 from public.campaigns c where c.id = campaign_id and c.user_id = auth.uid())
+  );
+
+-- system_logs (read-only for users, write-only for service role)
+create policy "Users can view own logs" on public.system_logs
+  for select using (
+    exists (select 1 from public.recipient_lists l where l.user_id = auth.uid())
+  );

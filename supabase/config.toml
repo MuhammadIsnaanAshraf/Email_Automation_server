@@ -1,0 +1,4 @@
+project_id = "your-project-id"
+
+[functions.send-tick]
+  verify_jwt = false

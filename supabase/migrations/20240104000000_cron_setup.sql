@@ -1,15 +1,13 @@
 -- ─────────────────────────────────────────────────────────────
+-- Migration: 20240104000000_cron_setup.sql
 -- FlowState — Module 4: Cron wiring (pg_cron → Edge Function)
---
--- This is what makes sending run "in the background with no server". pg_cron
--- fires every minute and uses pg_net to POST to the `send-tick` Edge Function,
--- which claims and sends whatever is due.
---
--- BEFORE running: deploy the function and set its secrets (see backend README
--- "Module 4"). Then replace the two placeholders below:
+-- ─────────────────────────────────────────────────────────────
+
+-- This migration sets up pg_cron to call the send-tick Edge Function every minute.
+-- BEFORE running: deploy the function and set its secrets (SEND_TICK_SECRET).
+-- Then replace the two placeholders below:
 --   <PROJECT_REF>       your Supabase project ref (e.g. abcdefgh)
 --   <SEND_TICK_SECRET>  the same value you set as the function's SEND_TICK_SECRET
--- ─────────────────────────────────────────────────────────────
 
 create extension if not exists pg_cron;
 create extension if not exists pg_net;

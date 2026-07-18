@@ -1,62 +1,7 @@
 -- ─────────────────────────────────────────────────────────────
--- FlowState — Module 4: Sending Engine (Scheduling & Throttling)
--- Run in the Supabase SQL editor AFTER 01, 02, 03.
---
--- When a campaign is scheduled, we materialize ONE row per recipient in
--- `campaign_sends`, each with its own `scheduled_at` computed up front (paced +
--- daily-capped). A background tick (pg_cron → Edge Function) then repeatedly
--- asks "which sends are due right now, across ALL users?", atomically CLAIMS
--- them (so a second overlapping tick can't grab them again), and sends them.
+-- Migration: 20240103000000_sending_functions.sql
+-- FlowState — Module 4: Sending Engine Functions
 -- ─────────────────────────────────────────────────────────────
-
--- Per-account daily send cap (Gmail free ≈ 500/day, Workspace ≈ 2000). Used at
--- schedule time to spread a big list across days, and as a runtime safety net.
-alter table public.users
-  add column if not exists daily_send_limit integer not null default 400;
-
--- ── campaign_sends: the per-recipient outbox ─────────────────
-create table if not exists public.campaign_sends (
-  id             uuid primary key default gen_random_uuid(),
-  campaign_id    uuid not null references public.campaigns(id) on delete cascade,
-  -- Denormalized so the claim query can cap + order per user without joins.
-  user_id        uuid not null references public.users(id) on delete cascade,
-  recipient_id   uuid references public.recipients(id) on delete set null,
-
-  -- Snapshot of the recipient (personalization data) so the sender is self
-  -- contained even if the source list is later edited/deleted.
-  email          text not null,
-  name           text,
-  company        text,
-  extra          jsonb not null default '{}'::jsonb,
-
-  scheduled_at   timestamptz not null,       -- this recipient's own turn
-  status         text not null default 'scheduled'
-                   check (status in ('scheduled','sending','sent','failed','canceled')),
-  attempts       integer not null default 0,
-  locked_at      timestamptz,                -- set when claimed ('sending')
-  sent_at        timestamptz,
-  gmail_message_id text,
-  error          text,
-
-  created_at     timestamptz not null default now(),
-  updated_at     timestamptz not null default now()
-);
-
--- The hot path: "scheduled rows whose time has arrived", scanned every minute.
-create index if not exists campaign_sends_due_idx
-  on public.campaign_sends (scheduled_at)
-  where status = 'scheduled';
--- Reclaiming rows stuck in 'sending' after a crashed pass.
-create index if not exists campaign_sends_inflight_idx
-  on public.campaign_sends (locked_at)
-  where status = 'sending';
-create index if not exists campaign_sends_campaign_idx on public.campaign_sends (campaign_id);
--- Fast daily-count per account.
-create index if not exists campaign_sends_user_sent_idx
-  on public.campaign_sends (user_id, sent_at)
-  where status = 'sent';
-
-alter table public.campaign_sends enable row level security;
 
 -- ── Atomic claim ─────────────────────────────────────────────
 -- Selects due (or crash-stuck) sends for ACTIVE campaigns, caps how many per
@@ -70,6 +15,7 @@ create or replace function public.claim_due_sends(
 )
 returns setof public.campaign_sends
 language plpgsql
+security definer
 as $$
 begin
   return query
@@ -120,6 +66,7 @@ $$;
 create or replace function public.refresh_campaign_progress(p_campaign_id uuid)
 returns void
 language plpgsql
+security definer
 as $$
 declare
   v_sent    integer;
@@ -148,3 +95,7 @@ begin
   where c.id = p_campaign_id;
 end;
 $$;
+
+-- Grant execute to authenticated users (for edge functions using service role)
+grant execute on function public.claim_due_sends(integer, integer, interval) to authenticated;
+grant execute on function public.refresh_campaign_progress(uuid) to authenticated;
