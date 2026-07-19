@@ -230,10 +230,21 @@ Deno.serve(async (req) => {
     const campaignIds = [...new Set(sends.map((s) => s.campaign_id))]
     const userIds = [...new Set(sends.map((s) => s.user_id))]
 
-    const [{ data: campaignRows }, { data: userRows }] = await Promise.all([
+    const [{ data: campaignRows }, { data: profileRows }, { data: settingsRows }] = await Promise.all([
       supabase.from('campaigns').select('id, subject, body').in('id', campaignIds),
-      supabase.from('users').select('id, email, name, daily_send_limit').in('id', userIds),
+      supabase.from('profiles').select('id, email, name').in('id', userIds),
+      supabase.from('user_settings').select('user_id, daily_send_limit').in('user_id', userIds),
     ])
+
+    const profiles = new Map((profileRows || []).map((p) => [p.id, p]))
+    const settings = new Map((settingsRows || []).map((s) => [s.user_id, s.daily_send_limit]))
+    const campaigns = new Map((campaignRows || []).map((c) => [c.id, { subject: c.subject, body: c.body }]))
+    const users = new Map<string, { email: string; name: string | null; daily_send_limit: number }>()
+    for (const userId of userIds) {
+      const p = profiles.get(userId)
+      const limit = settings.get(userId) ?? DEFAULT_DAILY_LIMIT
+      users.set(userId, { email: p?.email ?? '', name: p?.name ?? null, daily_send_limit: limit })
+    }
 
     const campaigns = new Map((campaignRows || []).map((c) => [c.id, { subject: c.subject, body: c.body }]))
     const users = new Map((userRows || []).map((u) => [u.id, u]))

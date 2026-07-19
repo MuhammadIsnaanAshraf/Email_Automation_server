@@ -4,16 +4,7 @@
 -- ─────────────────────────────────────────────────────────────
 
 -- Per-account daily send cap (Gmail free ≈ 500/day, Workspace ≈ 2000).
--- Used at schedule time to spread a big list across days, and as a runtime safety net.
--- We store this on the auth.users table via a custom metadata field since we can't alter auth.users directly.
--- Instead, we'll use a separate table for user settings.
-
-create table if not exists public.user_settings (
-  user_id           uuid primary key references auth.users(id) on delete cascade,
-  daily_send_limit  integer not null default 400,
-  created_at        timestamptz not null default now(),
-  updated_at        timestamptz not null default now()
-);
+-- Stored in public.user_settings (created in initial schema).
 
 -- ── campaign_sends: the per-recipient outbox ─────────────────
 create table if not exists public.campaign_sends (
@@ -55,16 +46,8 @@ create index if not exists campaign_sends_campaign_idx on public.campaign_sends 
 -- Fast daily-count per account.
 create index if not exists campaign_sends_user_date_idx on public.campaign_sends (user_id, scheduled_at);
 
--- RLS policies
-alter table public.user_settings enable row level security;
+-- RLS
 alter table public.campaign_sends enable row level security;
-
-create policy "Users can view own settings" on public.user_settings
-  for select using (user_id = auth.uid());
-
-create policy "Users can upsert own settings" on public.user_settings
-  for insert with check (user_id = auth.uid())
-  for update using (user_id = auth.uid());
 
 create policy "Users can view own campaign sends" on public.campaign_sends
   for select using (user_id = auth.uid());

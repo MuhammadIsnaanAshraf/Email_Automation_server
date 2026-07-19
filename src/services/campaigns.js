@@ -150,7 +150,7 @@ export async function deleteCampaign(userId, campaignId) {
 const SENDS_INSERT_CHUNK = 1000
 
 async function getUserDailyLimit(userId) {
-  const { data } = await supabase.from('users').select('daily_send_limit').eq('id', userId).single()
+  const { data } = await supabase.from('user_settings').select('daily_send_limit').eq('user_id', userId).single()
   return data?.daily_send_limit && data.daily_send_limit > 0 ? data.daily_send_limit : 400
 }
 

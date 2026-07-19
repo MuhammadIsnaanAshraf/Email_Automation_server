@@ -2,49 +2,40 @@ import { Router } from 'express'
 import { supabase } from '../lib/supabase.js'
 import { saveConnection, getConnection, toPublicStatus } from '../services/connections.js'
 import { requireAuth } from '../middleware/supabaseAuth.js'
+import { getTokenInfo } from '../lib/google.js'
 
 const router = Router()
 
-/* ── Exchange Supabase auth code for session ────────────────────
+/* ── Save the Gmail connection after sign-in ─────────────────────
    POST /auth/callback
-   Called from the frontend after Supabase OAuth redirect. We exchange
-   the code for a session and store the Gmail connection if present. */
-router.post('/callback', async (req, res) => {
-  const { code } = req.body
-  
+   Called from the frontend right after it exchanges the Supabase OAuth
+   `code` for a session. The `code` itself can't be exchanged here: it's a
+   PKCE code, so only the browser client that started the OAuth flow (and
+   holds the matching code_verifier) can redeem it — and it's single-use, so
+   the frontend must be the only one to redeem it. The frontend forwards us
+   the resulting Google provider tokens (not Supabase's own session tokens);
+   we look up their real expiry/scopes from Google and store them. */
+router.post('/callback', requireAuth, async (req, res) => {
+  const { provider_token: providerToken, provider_refresh_token: providerRefreshToken } = req.body
+
+  // No refresh token means Google didn't grant offline access this time
+  // (e.g. a repeat sign-in without prompt=consent) — nothing new to store.
+  if (!providerRefreshToken) {
+    return res.json({ ok: true, saved: false })
+  }
+
   try {
-    const { data, error } = await supabase.auth.exchangeCodeForSession(code)
-    
-    if (error || !data.session) {
-      return res.status(400).json({ error: 'auth_failed', message: error?.message })
-    }
-
-    const { session, user } = data
-    
-    // Store Gmail connection if we have a refresh token
-    if (session.provider_refresh_token) {
-      await saveConnection(user.id, {
-        access_token: session.access_token,
-        refresh_token: session.provider_refresh_token,
-        expiry_date: session.expires_at * 1000,
-        scope: session.provider_token?.scope || '',
-      })
-    }
-
-    res.json({
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.user_metadata?.full_name || user.user_metadata?.name,
-        avatarUrl: user.user_metadata?.avatar_url || user.user_metadata?.picture,
-      },
-      access_token: session.access_token,
-      refresh_token: session.refresh_token,
-      expires_at: session.expires_at,
+    const tokenInfo = await getTokenInfo(providerToken)
+    await saveConnection(req.user.id, {
+      access_token: providerToken,
+      refresh_token: providerRefreshToken,
+      expiry_date: tokenInfo.expiry_date,
+      scopes: tokenInfo.scopes,
     })
+    res.json({ ok: true, saved: true })
   } catch (err) {
-    console.error('[auth/callback] failed:', err)
-    res.status(500).json({ error: 'auth_failed' })
+    console.error('[auth/callback] failed to save Gmail connection:', err)
+    res.status(500).json({ error: 'connection_save_failed' })
   }
 })
 
@@ -52,8 +43,10 @@ router.post('/callback', async (req, res) => {
    GET /auth/connection/:userId
    Returns the Gmail connection status for the user. */
 router.get('/connection/:userId', requireAuth, async (req, res) => {
+  console.log("🚀 ~ [auth/connection] req.params.userId:", req.params.userId)
   try {
     const connection = await getConnection(req.params.userId)
+    console.log("🚀 ~ [auth/connection] connection:", connection)
     res.json(toPublicStatus(connection))
   } catch (err) {
     console.error('[auth/connection] failed:', err)
@@ -66,6 +59,7 @@ router.get('/connection/:userId', requireAuth, async (req, res) => {
    Starts a new OAuth flow to refresh the Gmail grant. */
 router.post('/reconnect', requireAuth, async (req, res) => {
   try {
+    console.log("🚀 ~ Reconnecting Gmail for user:", req.user.id)
     const { data, error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: {
@@ -77,6 +71,7 @@ router.post('/reconnect', requireAuth, async (req, res) => {
         },
       },
     })
+    console.log("🚀 ~ data:", data)
     
     if (error) throw error
     
@@ -92,6 +87,7 @@ router.post('/reconnect', requireAuth, async (req, res) => {
    Signs out from Supabase Auth. */
 router.post('/logout', requireAuth, async (req, res) => {
   try {
+    console.log("🚀 ~ Logging out user:", req.user.id)
     await supabase.auth.signOut()
     res.json({ ok: true })
   } catch (err) {

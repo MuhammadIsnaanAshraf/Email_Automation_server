@@ -6,8 +6,11 @@ import { refreshAccessToken } from '../lib/google.js'
    the app reads `status` to know whether the connection is healthy. */
 
 export async function saveConnection(userId, tokens) {
+  console.log("🚀 ~ saveConnection ~ userId:", userId)
+  console.log("🚀 ~ saveConnection ~ tokens:", tokens)
   const scopes = tokens.scope ? tokens.scope.split(' ') : 
                  tokens.scopes ? tokens.scopes : []
+  console.log("🚀 ~ saveConnection ~ scopes:", scopes)
 
   // Google only returns a refresh_token on the first consent (or when we force
   // prompt=consent). Never overwrite a stored one with null.
@@ -28,6 +31,7 @@ export async function saveConnection(userId, tokens) {
   const { error } = await supabase
     .from('google_connections')
     .upsert(row, { onConflict: 'user_id' })
+    console.log("🚀 ~ saveConnection ~ error:", error)
   if (error) throw error
 }
 
@@ -44,6 +48,7 @@ export async function getConnection(userId) {
 /* Public-facing view of the connection — safe to send to the frontend. Never
    includes the tokens themselves. This is what powers the "reconnect" prompt. */
 export function toPublicStatus(connection) {
+  console.log("🚀 ~ toPublicStatus ~ connection:", connection)
   if (!connection) {
     return { status: 'disconnected', canSendEmail: false, needsReconnect: true }
   }

@@ -5,15 +5,84 @@
 
 create extension if not exists "pgcrypto";
 
+-- ── Updated_at trigger helper ────────────────────────────────
+create or replace function public.update_updated_at_column()
+returns trigger language plpgsql as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
+-- ── Profiles ───────────────────────────────────────────────────
+-- Public profile table, populated from auth.users via trigger.
+-- Extensible for additional user metadata.
+create table if not exists public.profiles (
+  id        uuid primary key references auth.users(id) on delete cascade,
+  email     text not null,
+  name      text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create trigger profiles_updated_at
+  before update on public.profiles
+  for each row execute function public.update_updated_at_column();
+
+-- Sync auth.users → profiles
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer as $$
+begin
+  insert into public.profiles (id, email, name)
+  values (new.id, new.email, new.raw_user_meta_data->>'full_name')
+  on conflict (id) do update set
+    email = excluded.email,
+    name = excluded.name,
+    updated_at = now();
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.handle_new_user();
+
+-- ── User settings ──────────────────────────────────────────────
+-- Per-user configuration (daily send limit, etc.)
+create table if not exists public.user_settings (
+  user_id          uuid primary key references auth.users(id) on delete cascade,
+  daily_send_limit integer not null default 400,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now()
+);
+
+create trigger user_settings_updated_at
+  before update on public.user_settings
+  for each row execute function public.update_updated_at_column();
+
+-- Auto-create settings on user signup
+create or replace function public.handle_new_user_settings()
+returns trigger language plpgsql security definer as $$
+begin
+  insert into public.user_settings (user_id)
+  values (new.id)
+  on conflict (user_id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created_settings on auth.users;
+create trigger on_auth_user_created_settings
+  after insert on auth.users
+  for each row execute function public.handle_new_user_settings();
+
 -- ── Google connections ───────────────────────────────────────
--- The Gmail-sending grant for a user. Refresh token is stored encrypted.
--- `status` lets the app tell the user when the connection needs re-linking
--- instead of failing silently at send time.
 create table if not exists public.google_connections (
   user_id        uuid primary key references auth.users(id) on delete cascade,
-  refresh_token  text,                        -- encrypted (AES-256-GCM), may be null if Google didn't return one
-  access_token   text,                        -- encrypted; short-lived, refreshed as needed
-  token_expiry   timestamptz,                 -- when the access_token expires
+  refresh_token  text,
+  access_token   text,
+  token_expiry   timestamptz,
   scopes         text[] not null default '{}',
   status         text not null default 'connected'
                    check (status in ('connected', 'expired', 'revoked', 'error')),
@@ -44,6 +113,7 @@ create index if not exists recipient_lists_user_id_idx on public.recipient_lists
 create table if not exists public.recipients (
   id                 uuid primary key default gen_random_uuid(),
   list_id            uuid not null references public.recipient_lists(id) on delete cascade,
+  user_id            uuid not null references auth.users(id) on delete cascade,
   email              text not null,
   normalized_email   text not null,
   name               text,
@@ -58,6 +128,8 @@ create table if not exists public.recipients (
 
 create index if not exists recipients_list_id_idx on public.recipients(list_id);
 create index if not exists recipients_list_email_idx on public.recipients(list_id, normalized_email);
+create index if not exists recipients_user_id_idx on public.recipients(user_id);
+create index if not exists recipients_user_list_idx on public.recipients(user_id, list_id);
 
 -- ── Templates ────────────────────────────────────────────────
 create table if not exists public.templates (
@@ -124,7 +196,18 @@ create table if not exists public.system_logs (
 
 create index if not exists system_logs_created_at_idx on public.system_logs(created_at desc);
 
+-- ── Updated_at trigger helper ────────────────────────────────
+create or replace function public.update_updated_at_column()
+returns trigger language plpgsql as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$;
+
 -- Lock everything down; only the service role (our backend) bypasses RLS.
+alter table public.profiles enable row level security;
+alter table public.user_settings enable row level security;
 alter table public.google_connections enable row level security;
 alter table public.recipient_lists enable row level security;
 alter table public.recipients enable row level security;
@@ -134,6 +217,20 @@ alter table public.campaign_recipients enable row level security;
 alter table public.system_logs enable row level security;
 
 -- ── RLS Policies ─────────────────────────────────────────────
+
+-- profiles
+create policy "Users can view own profile" on public.profiles
+  for select using (id = auth.uid());
+
+create policy "Users can update own profile" on public.profiles
+  for update using (id = auth.uid());
+
+-- user_settings
+create policy "Users can view own settings" on public.user_settings
+  for select using (user_id = auth.uid());
+
+create policy "Users can update own settings" on public.user_settings
+  for update using (user_id = auth.uid());
 
 -- google_connections
 create policy "Users can view own connections" on public.google_connections
@@ -160,24 +257,16 @@ create policy "Users can delete own lists" on public.recipient_lists
 
 -- recipients
 create policy "Users can view own recipients" on public.recipients
-  for select using (
-    exists (select 1 from public.recipient_lists l where l.id = list_id and l.user_id = auth.uid())
-  );
+  for select using (user_id = auth.uid());
 
 create policy "Users can insert own recipients" on public.recipients
-  for insert with check (
-    exists (select 1 from public.recipient_lists l where l.id = list_id and l.user_id = auth.uid())
-  );
+  for insert with check (user_id = auth.uid());
 
 create policy "Users can update own recipients" on public.recipients
-  for update using (
-    exists (select 1 from public.recipient_lists l where l.id = list_id and l.user_id = auth.uid())
-  );
+  for update using (user_id = auth.uid());
 
 create policy "Users can delete own recipients" on public.recipients
-  for delete using (
-    exists (select 1 from public.recipient_lists l where l.id = list_id and l.user_id = auth.uid())
-  );
+  for delete using (user_id = auth.uid());
 
 -- templates
 create policy "Users can view own templates" on public.templates
