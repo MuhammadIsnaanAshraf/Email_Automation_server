@@ -18,6 +18,75 @@ export class ListError extends Error {
   }
 }
 
+/* Common logic to persist a draft list + recipients after parsing/validation.
+   Used by both createDraftFromSheet (server-side parse) and createDraftFromData
+   (client-side parse). */
+async function insertDraftList({ userId, listName, filename, recipients, headers, columnMap }) {
+  const columnMapDescription = describeColumnMap(headers, columnMap)
+  const validCount = recipients.filter((r) => r.is_valid).length
+  const invalidCount = recipients.length - validCount
+
+  const { data: list, error: listErr } = await supabase
+    .from('recipient_lists')
+    .insert({
+      user_id: userId,
+      name: listName || filename || 'Untitled list',
+      source_filename: filename || null,
+      status: 'draft',
+      column_map: columnMapDescription,
+      detected_headers: headers,
+      total_rows: recipients.length,
+      valid_rows: validCount,
+      invalid_rows: invalidCount,
+    })
+    .select()
+    .single()
+  if (listErr) throw listErr
+
+  try {
+    for (let i = 0; i < recipients.length; i += INSERT_CHUNK) {
+      const chunk = recipients.slice(i, i + INSERT_CHUNK).map((r) => ({
+        list_id: list.id,
+        user_id: userId,
+        email: r.email,
+        normalized_email: r.email ? r.email.toLowerCase().trim() : '',
+        name: r.name || null,
+        company: r.company || null,
+        row_number: r.row_number,
+        is_valid: r.is_valid,
+        errors: r.errors || [],
+        warnings: r.warnings || [],
+        extra_data: r.extra || r.extra_data || {},
+      }))
+      const { error } = await supabase.from('recipients').insert(chunk)
+      if (error) throw error
+    }
+  } catch (err) {
+    await supabase.from('recipient_lists').delete().eq('id', list.id)
+    throw err
+  }
+
+  return list.id
+}
+
+/* Accept already-parsed-and-validated data from the frontend
+   (client-side XLSX parsing). The data must already be in recipient shape. */
+export async function createDraftFromData({ userId, recipients, headers, columnMap, listName }) {
+  const validCount = recipients.filter((r) => r.is_valid).length
+  if (validCount < 1) {
+    throw new ListError('This list has no valid recipients.', 422)
+  }
+
+  return insertDraftList({
+    userId,
+    listName,
+    filename: listName || null,
+    recipients,
+    headers,
+    columnMap,
+  })
+}
+
 /* Parse + validate an uploaded sheet and persist it as a DRAFT list plus its
    recipient rows. Returns the created list id. Throws ListError with a clear
    message (e.g. no email column) so the route can 4xx instead of half-saving. */
@@ -36,38 +105,14 @@ export async function createDraftFromSheet({ userId, buffer, filename, mimetype,
   const recipients = validateRows(headers, rows, columnMap)
   const validCount = recipients.filter((r) => r.is_valid).length
 
-  // 1) Create the list row (draft).
-  const { data: list, error: listErr } = await supabase
-    .from('recipient_lists')
-    .insert({
-      user_id: userId,
-      name: listName || filename || 'Untitled list',
-      source_filename: filename || null,
-      status: 'draft',
-      column_map: describeColumnMap(headers, columnMap),
-      detected_headers: headers,
-      total_rows: recipients.length,
-      valid_rows: validCount,
-      invalid_rows: recipients.length - validCount,
-    })
-    .select()
-    .single()
-  if (listErr) throw listErr
-
-  // 2) Insert recipients in chunks. If any chunk fails, roll back the list so we
-  //    never leave a half-populated draft behind.
-  try {
-    for (let i = 0; i < recipients.length; i += INSERT_CHUNK) {
-      const chunk = recipients.slice(i, i + INSERT_CHUNK).map((r) => ({ ...r, list_id: list.id }))
-      const { error } = await supabase.from('recipients').insert(chunk)
-      if (error) throw error
-    }
-  } catch (err) {
-    await supabase.from('recipient_lists').delete().eq('id', list.id)
-    throw err
-  }
-
-  return list.id
+  return insertDraftList({
+    userId,
+    listName,
+    filename,
+    recipients,
+    headers,
+    columnMap,
+  })
 }
 
 /* All lists for a user, newest first (metadata only — no recipient rows). */

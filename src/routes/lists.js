@@ -5,6 +5,7 @@ import { SheetParseError } from '../lib/parseSheet.js'
 import { ISSUE_LABELS } from '../lib/validateRecipients.js'
 import {
   ListError,
+  createDraftFromData,
   createDraftFromSheet,
   getListsForUser,
   getListForUser,
@@ -23,11 +24,11 @@ const ACCEPTED = new Set([
   'text/tab-separated-values',
   'application/vnd.ms-excel',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  'application/octet-stream', // some browsers send this for .csv/.xlsx
+  'application/octet-stream',
 ])
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024, files: 1 }, // 5 MB
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => {
     const okExt = /\.(csv|tsv|txt|xlsx|xls)$/i.test(file.originalname || '')
     if (ACCEPTED.has(file.mimetype) || okExt) return cb(null, true)
@@ -35,10 +36,8 @@ const upload = multer({
   },
 })
 
-// Everything here requires a signed-in user.
 router.use(requireAuth)
 
-/* Attach human-readable labels to a recipient's issue codes for the UI. */
 function decorate(recipient) {
   return {
     ...recipient,
@@ -50,24 +49,38 @@ function decorate(recipient) {
   }
 }
 
-/* ── Upload + parse + validate → draft ────────────────────────
-   POST /lists/upload   (multipart/form-data; field "file", optional "name")
-   Parses and validates server-side, saves a DRAFT, and returns the preview so
-   the user can review before confirming. Nothing is "sent" here. */
-router.post('/upload', upload.single('file'), async (req, res, next) => {
+/* ── Upload parsed data (client-side parsed) ───────────────────
+   POST /lists/upload   { name, recipients, headers, columnMap }
+   Accepts JSON with already-parsed and validated rows from the frontend. */
+router.post('/upload', async (req, res, next) => {
   try {
-    if (!req.file) throw new ListError('No file was uploaded (field name must be "file").', 400)
+    console.log("req.body", req.body)
+    const { name, recipients, headers, columnMap } = req.body
 
-    const listId = await createDraftFromSheet({
+    if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
+      throw new ListError('No recipients provided.', 400)
+    }
+    if (!headers || !Array.isArray(headers) || headers.length === 0) {
+      throw new ListError('No headers provided.', 400)
+    }
+    if (!columnMap || columnMap.email == null) {
+      throw new ListError('No email column mapping provided.', 400)
+    }
+
+    const listId = await createDraftFromData({
       userId: req.user.id,
-      buffer: req.file.buffer,
-      filename: req.file.originalname,
-      mimetype: req.file.mimetype,
-      listName: req.body?.name?.trim() || null,
+      recipients,
+      headers,
+      columnMap,
+      listName: name?.trim() || null,
     })
 
     const list = await getListForUser(req.user.id, listId)
-    // Return a first page of rows and the invalid ones up front for the preview.
+
+    if (!list) {
+      throw new ListError('List was created but could not be retrieved.', 500)
+    }
+
     const sample = await getRecipients(listId, { filter: 'all', page: 1, pageSize: 50 })
     const invalid = await getRecipients(listId, { filter: 'invalid', page: 1, pageSize: 50 })
 
