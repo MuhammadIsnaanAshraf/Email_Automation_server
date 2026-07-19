@@ -16,11 +16,3 @@ export async function refreshAccessToken(refreshToken) {
   const { credentials } = await client.refreshAccessToken()
   return credentials // { access_token, expiry_date, scope, ... }
 }
-
-/* Look up the real expiry and granted scopes for a Google access token. Used
-   right after OAuth sign-in: Supabase hands us the provider access token but
-   not its expiry or scopes, so we ask Google directly. */
-export async function getTokenInfo(accessToken) {
-  const client = makeOAuthClient()
-  return client.getTokenInfo(accessToken) // { expiry_date, scopes, ... }
-}

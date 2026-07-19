@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { supabase } from '../lib/supabase.js'
 import { saveConnection, getConnection, toPublicStatus } from '../services/connections.js'
 import { requireAuth } from '../middleware/supabaseAuth.js'
-import { getTokenInfo } from '../lib/google.js'
+import { GOOGLE_SCOPES } from '../config/env.js'
 
 const router = Router()
 
@@ -13,8 +13,7 @@ const router = Router()
    PKCE code, so only the browser client that started the OAuth flow (and
    holds the matching code_verifier) can redeem it — and it's single-use, so
    the frontend must be the only one to redeem it. The frontend forwards us
-   the resulting Google provider tokens (not Supabase's own session tokens);
-   we look up their real expiry/scopes from Google and store them. */
+   the resulting Google provider tokens (not Supabase's own session tokens). */
 router.post('/callback', requireAuth, async (req, res) => {
   const { provider_token: providerToken, provider_refresh_token: providerRefreshToken } = req.body
 
@@ -25,12 +24,16 @@ router.post('/callback', requireAuth, async (req, res) => {
   }
 
   try {
-    const tokenInfo = await getTokenInfo(providerToken)
     await saveConnection(req.user.id, {
       access_token: providerToken,
       refresh_token: providerRefreshToken,
-      expiry_date: tokenInfo.expiry_date,
-      scopes: tokenInfo.scopes,
+      // Supabase doesn't tell us the provider token's real expiry. Mark it as
+      // already due for refresh so the first real send fetches an accurate
+      // expiry/scope straight from Google's token endpoint (getValidAccessToken
+      // -> refreshAccessToken), instead of depending on an extra Google API
+      // call in the sign-in critical path.
+      expiry_date: Date.now(),
+      scopes: GOOGLE_SCOPES,
     })
     res.json({ ok: true, saved: true })
   } catch (err) {
