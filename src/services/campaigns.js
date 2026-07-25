@@ -3,6 +3,7 @@ import { extractVariables } from '../lib/personalize.js'
 import { computeSendTimes, frequencyToIntervalSeconds } from '../lib/scheduleSends.js'
 import { getListForUser, getRecipients } from './lists.js'
 import { getTemplateForUser } from './templates.js'
+import { getValidAccessToken } from './connections.js'
 
 export class CampaignError extends Error {
   constructor(message, status = 400) {
@@ -23,6 +24,10 @@ export class CampaignError extends Error {
    - The list must belong to the user and have at least one valid recipient. */
 export async function createCampaign(userId, input = {}) {
   const { templateId = null, listId, scheduledAt = null, frequency = {} } = input
+  console.log("🚀 ~ createCampaign ~ frequency:", frequency)
+  console.log("🚀 ~ createCampaign ~ scheduledAt:", scheduledAt)
+  console.log("🚀 ~ createCampaign ~ listId:", listId)
+  console.log("🚀 ~ createCampaign ~ templateId:", templateId)
 
   if (!listId) throw new CampaignError('A recipient list is required.', 422)
 
@@ -182,6 +187,15 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     throw new CampaignError(`Campaign is already ${campaign.status}.`, 409)
   }
 
+  // Mint (or refresh) a Gmail access token now, up front, rather than letting
+  // the send-tick cron discover a dead connection later. This also means the
+  // token is already cached in google_connections by the time the first send
+  // is due, so the tick can reuse it instead of paying for a refresh itself.
+  const token = await getValidAccessToken(userId)
+  if (token.error) {
+    throw new CampaignError('Gmail is not connected. Reconnect your account before scheduling.', 409)
+  }
+
   // Don't double-schedule: a campaign's sends are created exactly once.
   const { count: existing } = await supabase
     .from('campaign_sends')
@@ -212,7 +226,12 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     email: r.email,
     name: r.name,
     company: r.company,
-    extra: r.extra || {},
+    cc: r.cc || null,
+    bcc: r.bcc || null,
+    // Recipient rows store the extra columns as `extra_data`; the send snapshot
+    // column is `extra`. Read the former (falling back to `extra`) so {{token}}
+    // personalization from unmapped columns actually survives into the send.
+    extra: r.extra_data || r.extra || {},
     scheduled_at: times[i].toISOString(),
     status: 'scheduled',
   }))

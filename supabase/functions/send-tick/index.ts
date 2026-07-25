@@ -3,21 +3,35 @@
 //
 // Invoked ~every minute by pg_cron (see backend/db/05_cron_setup.sql). Each run:
 //   1. Atomically CLAIMS due sends across ALL users (claim_due_sends), capping
-//      per user so no single account bursts — this also flips them to 'sending'
-//      so an overlapping tick can't grab them again (no double-sends).
-//   2. Groups the claim by user and processes users CONCURRENTLY, but each
-//      user's own emails go out one-by-one with a small gap (anti-spam spacing).
-//   3. Sends via Gmail using the user's stored OAuth token. A single failure is
-//      recorded and the rest continue.
+//      to ONE send per user per tick — so a single account never bursts, even
+//      if several of its campaigns happen to collide on the same due slot.
+//      There's no cap on the total claimed in one pass; the natural ceiling is
+//      "one per account with something due". Rows a user couldn't get to this
+//      tick are pushed to the next minute by claim_due_sends itself (tracked
+//      via reschedule_count), never left behind with a stale scheduled_at.
+//   2. Processes users CONCURRENTLY — each user contributes at most one send,
+//      so there's no per-user pacing loop needed within a single tick.
+//   3. Sends via Gmail using a CACHED access token (google_connections.access_token),
+//      refreshed only when it's actually expired — not on every tick. Campaign
+//      scheduling (backend/src/services/campaigns.js) mints one eagerly up
+//      front, so a healthy account's tick almost never pays for the refresh
+//      round-trip. A single send failure is recorded and the rest continue.
 //   4. Rolls up per-campaign progress.
 //
 // No persistent server, no worker — this whole file only runs when ticked.
 // ─────────────────────────────────────────────────────────────
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
-import { decryptToken } from './crypto.ts'
+import { createClient } from 'npm:@supabase/supabase-js@2'
+import { decryptToken, encryptToken } from './crypto.ts'
 import { renderForRecipient } from './render.ts'
 import { refreshAccessToken, sendEmail, SendError, ConnectionError } from './gmail.ts'
+
+// How much longer a cached access token must still have left before we'll
+// reuse it without hitting Google. Access tokens mint ~1hr; campaigns are
+// scheduled (and a token is minted eagerly) at that time by the Express
+// backend, so most ticks hit this cache and skip the refresh round-trip
+// entirely instead of paying for it on every user, every minute.
+const TOKEN_EXPIRY_BUFFER_MS = 60_000
 
 // ── Config (Edge Function secrets) ───────────────────────────
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
@@ -27,17 +41,14 @@ const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET')!
 const TOKEN_ENCRYPTION_KEY = Deno.env.get('TOKEN_ENCRYPTION_KEY')!
 const TICK_SECRET = Deno.env.get('SEND_TICK_SECRET')!
 
-const MAX_PER_PASS = Number(Deno.env.get('SEND_MAX_PER_PASS') ?? '200')
-const MAX_PER_USER = Number(Deno.env.get('SEND_MAX_PER_USER_PER_PASS') ?? '5')
-const INTRA_DELAY_MS = Number(Deno.env.get('SEND_INTRA_PASS_DELAY_MS') ?? '8000')
+// One send per account per tick (the tick itself runs once a minute).
+const MAX_PER_USER = Number(Deno.env.get('SEND_MAX_PER_USER_PER_PASS') ?? '1')
 const DEFAULT_DAILY_LIMIT = Number(Deno.env.get('SEND_DEFAULT_DAILY_LIMIT') ?? '400')
 const MAX_ATTEMPTS = Number(Deno.env.get('SEND_MAX_ATTEMPTS') ?? '5')
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, {
   auth: { persistSession: false, autoRefreshToken: false },
 })
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 interface Send {
   id: string
@@ -46,6 +57,8 @@ interface Send {
   email: string
   name: string | null
   company: string | null
+  cc: string | null
+  bcc: string | null
   extra: Record<string, unknown> | null
   attempts: number
 }
@@ -101,32 +114,56 @@ function startOfUtcDayISO(): string {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())).toISOString()
 }
 
-// ── Process one user's claimed batch (sequential, with spacing) ──
-async function processUser(
+// ── Process one user's single claimed send for this tick ─────
+async function processUserSend(
   userId: string,
-  sends: Send[],
+  send: Send,
   campaigns: Map<string, { subject: string; body: string }>,
   user: { email: string; name: string | null; daily_send_limit: number | null }
 ) {
   const summary = { sent: 0, failed: 0, rescheduled: 0, deferred: 0 }
 
-  // 1) Get a valid access token for this account (one refresh per pass).
+  // 1) Get a valid access token for this account — reuse the cached one from
+  // google_connections (minted at campaign-schedule time, or by an earlier
+  // tick) as long as it's not near expiry. Only talk to Google when it's
+  // actually stale, instead of refreshing unconditionally every tick.
   let accessToken: string
   try {
     const { data: conn } = await supabase
-      .from('google_connections')
-      .select('refresh_token, status')
-      .eq('user_id', userId)
-      .single()
+    .from('google_connections')
+    .select('refresh_token, access_token, token_expiry, status')
+    .eq('user_id', userId)
+    .single()
+    console.log("🚀 ~ processUserSend ~ data:", conn)
 
-    const refreshToken = await decryptToken(conn?.refresh_token ?? null, TOKEN_ENCRYPTION_KEY)
-    if (!refreshToken) throw new ConnectionError('No Gmail connection on file.', 'no_refresh_token')
+    const expiry = conn?.token_expiry ? new Date(conn.token_expiry).getTime() : 0
+    const cached = conn?.access_token ? await decryptToken(conn.access_token, TOKEN_ENCRYPTION_KEY) : null
 
-    accessToken = await refreshAccessToken(refreshToken, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
+    if (cached && expiry - TOKEN_EXPIRY_BUFFER_MS > Date.now()) {
+      accessToken = cached
+    } else {
+      const refreshToken = await decryptToken(conn?.refresh_token ?? null, TOKEN_ENCRYPTION_KEY)
+      console.log("🚀 ~ processUserSend ~ refreshToken:", refreshToken)
+      if (!refreshToken) throw new ConnectionError('No Gmail connection on file.', 'no_refresh_token')
+
+      const refreshed = await refreshAccessToken(refreshToken, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
+      console.log("🚀 ~ processUserSend ~ refreshed:", refreshed)
+      accessToken = refreshed.accessToken
+      await supabase
+        .from('google_connections')
+        .update({
+          access_token: await encryptToken(refreshed.accessToken, TOKEN_ENCRYPTION_KEY),
+          token_expiry: new Date(refreshed.expiresAt).toISOString(),
+          status: 'connected',
+          last_error: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', userId)
+    }
   } catch (err) {
     // Whole account can't send. Flag the connection so the app prompts a
-    // reconnect (ties into Module 1), and retry these sends later rather than
-    // burning them — unless they've been retried too many times.
+    // reconnect (ties into Module 1), and retry later rather than burning
+    // this send — unless it's been retried too many times.
     const code = err instanceof ConnectionError ? err.code : 'connection_error'
     const status = code === 'revoked' ? 'revoked' : 'expired'
     await supabase
@@ -134,67 +171,68 @@ async function processUser(
       .update({ status, last_error: String(err), updated_at: new Date().toISOString() })
       .eq('user_id', userId)
 
-    for (const s of sends) {
-      const outcome = await handleRetryable(s, 30 * 60 * 1000, `connection_${code}`)
-      outcome === 'failed' ? summary.failed++ : summary.rescheduled++
-    }
+    const outcome = await handleRetryable(send, 30 * 60 * 1000, `connection_${code}`)
+    outcome === 'failed' ? summary.failed++ : summary.rescheduled++
     return summary
   }
 
   // 2) Runtime daily-cap safety net (across all this user's campaigns today).
   const dailyLimit = user.daily_send_limit && user.daily_send_limit > 0 ? user.daily_send_limit : DEFAULT_DAILY_LIMIT
+  console.log("🚀 ~ processUserSend ~ dailyLimit:", dailyLimit)
   const { count: sentToday } = await supabase
     .from('campaign_sends')
     .select('id', { count: 'exact', head: true })
     .eq('user_id', userId)
     .eq('status', 'sent')
     .gte('sent_at', startOfUtcDayISO())
-  let budget = dailyLimit - (sentToday || 0)
+
+  if (dailyLimit - (sentToday || 0) <= 0) {
+    // Over the daily cap — roll this one to tomorrow.
+    await reschedule(send.id, 24 * 60 * 60 * 1000, 'daily_limit_reached')
+    summary.deferred++
+    return summary
+  }
+
+  const campaign = campaigns.get(send.campaign_id)
+  if (!campaign) {
+    await markFailed(send.id, 'campaign_missing')
+    summary.failed++
+    return summary
+  }
 
   const fromAddress = user.name ? `${user.name} <${user.email}>` : user.email
 
-  // 3) Send this user's emails one at a time, with a gap between each.
-  for (let i = 0; i < sends.length; i++) {
-    const send = sends[i]
-
-    if (budget <= 0) {
-      // Over the daily cap — roll this one to tomorrow.
-      await reschedule(send.id, 24 * 60 * 60 * 1000, 'daily_limit_reached')
-      summary.deferred++
-      continue
-    }
-
-    const campaign = campaigns.get(send.campaign_id)
-    if (!campaign) {
-      await markFailed(send.id, 'campaign_missing')
-      summary.failed++
-      continue
-    }
-
-    try {
-      const { subject, body } = renderForRecipient(campaign, send)
-      const messageId = await sendEmail(accessToken, {
-        from: fromAddress,
-        to: send.email,
-        subject,
-        html: body,
-      })
-      await markSent(send.id, messageId)
-      summary.sent++
-      budget--
-    } catch (err) {
-      if (err instanceof SendError && err.retryable) {
-        const outcome = await handleRetryable(send, 5 * 60 * 1000, err.code)
-        outcome === 'failed' ? summary.failed++ : summary.rescheduled++
-      } else {
-        // Terminal (bad address, permanent 4xx): fail this one, keep going.
-        await markFailed(send.id, err instanceof Error ? err.message : String(err))
-        summary.failed++
+  try {
+    const { subject, body } = renderForRecipient(campaign, send)
+    const messageId = await sendEmail(accessToken, {
+      from: fromAddress,
+      to: send.email,
+      cc: send.cc,
+      bcc: send.bcc,
+      subject,
+      html: body,
+    })
+    await markSent(send.id, messageId)
+    summary.sent++
+  } catch (err) {
+    if (err instanceof SendError && err.retryable) {
+      if (err.code === 'http_401') {
+        // Gmail rejected the cached token outright even though our clock
+        // thought it still had time left — clear the cache so the next
+        // attempt is forced to mint a fresh one instead of reusing it for
+        // up to another hour.
+        await supabase
+          .from('google_connections')
+          .update({ access_token: null, token_expiry: null })
+          .eq('user_id', userId)
       }
+      const outcome = await handleRetryable(send, 5 * 60 * 1000, err.code)
+      outcome === 'failed' ? summary.failed++ : summary.rescheduled++
+    } else {
+      // Terminal (bad address, permanent 4xx): fail this one.
+      await markFailed(send.id, err instanceof Error ? err.message : String(err))
+      summary.failed++
     }
-
-    // Space out sends from the SAME account (skip the wait after the last one).
-    if (i < sends.length - 1) await sleep(INTRA_DELAY_MS)
   }
 
   return summary
@@ -213,9 +251,9 @@ Deno.serve(async (req) => {
   }
 
   try {
-    // 1) Claim what's due, across every user, atomically.
+    // 1) Claim what's due, across every user, atomically. Capped per user
+    // (default 1); no cap on the total claimed in one pass.
     const { data: claimed, error: claimErr } = await supabase.rpc('claim_due_sends', {
-      p_max_total: MAX_PER_PASS,
       p_max_per_user: MAX_PER_USER,
       p_lock_ttl: '5 minutes',
     })
@@ -236,9 +274,21 @@ Deno.serve(async (req) => {
       supabase.from('user_settings').select('user_id, daily_send_limit').in('user_id', userIds),
     ])
 
-    const profiles = new Map((profileRows || []).map((p) => [p.id, p]))
-    const settings = new Map((settingsRows || []).map((s) => [s.user_id, s.daily_send_limit]))
-    const campaigns = new Map((campaignRows || []).map((c) => [c.id, { subject: c.subject, body: c.body }]))
+    const profiles = new Map<string, { email: string; name: string | null }>(
+      (profileRows || []).map((p: { id: string; email: string; name: string | null }) => [p.id, p])
+    )
+    const settings = new Map<string, number | null>(
+      (settingsRows || []).map((s: { user_id: string; daily_send_limit: number | null }) => [
+        s.user_id,
+        s.daily_send_limit,
+      ])
+    )
+    const campaigns = new Map<string, { subject: string; body: string }>(
+      (campaignRows || []).map((c: { id: string; subject: string; body: string }) => [
+        c.id,
+        { subject: c.subject, body: c.body },
+      ])
+    )
     const users = new Map<string, { email: string; name: string | null; daily_send_limit: number }>()
     for (const userId of userIds) {
       const p = profiles.get(userId)
@@ -246,33 +296,40 @@ Deno.serve(async (req) => {
       users.set(userId, { email: p?.email ?? '', name: p?.name ?? null, daily_send_limit: limit })
     }
 
-    const campaigns = new Map((campaignRows || []).map((c) => [c.id, { subject: c.subject, body: c.body }]))
-    const users = new Map((userRows || []).map((u) => [u.id, u]))
-
-    // 3) Group by user; run users concurrently, each user's sends spaced.
-    const byUser = new Map<string, Send[]>()
+    // 3) Claim caps to one row per user, so this is naturally 1:1 — but stay
+    // defensive and only take the first if that ever isn't the case.
+    const byUser = new Map<string, Send>()
     for (const s of sends) {
-      if (!byUser.has(s.user_id)) byUser.set(s.user_id, [])
-      byUser.get(s.user_id)!.push(s)
+      if (!byUser.has(s.user_id)) byUser.set(s.user_id, s)
     }
 
-    const perUser = await Promise.all(
-      [...byUser.entries()].map(([userId, userSends]) => {
+    // 4) Run every user's single send concurrently.
+    const results = await Promise.allSettled(
+      [...byUser.entries()].map(([userId, send]) => {
         const user = users.get(userId) || { email: '', name: null, daily_send_limit: DEFAULT_DAILY_LIMIT }
         if (!user.email) {
-          // No account email — can't set a From; fail these clearly.
-          return Promise.all(userSends.map((s) => markFailed(s.id, 'user_missing'))).then(() => ({
+          // No account email — can't set a From; fail this clearly.
+          return markFailed(send.id, 'user_missing').then(() => ({
             sent: 0,
-            failed: userSends.length,
+            failed: 1,
             rescheduled: 0,
             deferred: 0,
           }))
         }
-        return processUser(userId, userSends, campaigns, user)
+        return processUserSend(userId, send, campaigns, user)
       })
     )
 
-    // 4) Roll up progress for each campaign touched this pass.
+    // Log any per-user failures and extract summaries.
+    const perUser = results.map((r) => {
+      if (r.status === 'rejected') {
+        console.error('[send-tick] per-user send failed:', r.reason)
+        return { sent: 0, failed: 0, rescheduled: 0, deferred: 0 }
+      }
+      return r.value
+    })
+
+    // 5) Roll up progress for each campaign touched this pass.
     await Promise.all(campaignIds.map((id) => supabase.rpc('refresh_campaign_progress', { p_campaign_id: id })))
 
     const totals = perUser.reduce(

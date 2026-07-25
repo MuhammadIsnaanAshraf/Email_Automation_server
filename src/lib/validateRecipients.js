@@ -8,11 +8,26 @@ const FIELD_SYNONYMS = {
   email: ['email', 'e mail', 'email address', 'mail', 'recipient', 'recipient email', 'to', 'work email'],
   name: ['name', 'full name', 'contact', 'contact name', 'recipient name', 'first name', 'person'],
   company: ['company', 'company name', 'organization', 'organisation', 'org', 'business', 'account'],
+  cc: ['cc', 'carbon copy', 'copy', 'cc email', 'cc emails'],
+  bcc: ['bcc', 'blind carbon copy', 'blind copy', 'bcc email', 'bcc emails'],
 }
 
 // Pragmatic email check: something@something.tld, no spaces. Not RFC-perfect on
 // purpose — it catches the typos this preview exists to surface.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
+
+/* A CC/BCC cell may list several addresses (comma- or semicolon-separated).
+   Keep only the well-formed ones, joined comma-separated for the MIME header;
+   invalid fragments are dropped so a stray typo in CC can never fail the send
+   to the primary recipient. Returns null when nothing valid remains. */
+function sanitizeAddressList(raw) {
+  if (!raw) return null
+  const valid = String(raw)
+    .split(/[,;]+/)
+    .map((a) => a.trim())
+    .filter((a) => a && EMAIL_RE.test(a))
+  return valid.length ? valid.join(', ') : null
+}
 
 function normalizeHeader(h) {
   return String(h || '')
@@ -26,7 +41,7 @@ function normalizeHeader(h) {
    Returns { email, name, company } as column indexes (or null if not found). */
 export function buildColumnMap(headers) {
   const normalized = headers.map(normalizeHeader)
-  const map = { email: null, name: null, company: null }
+  const map = { email: null, name: null, company: null, cc: null, bcc: null }
 
   for (const [field, synonyms] of Object.entries(FIELD_SYNONYMS)) {
     for (let i = 0; i < normalized.length; i++) {
@@ -34,6 +49,7 @@ export function buildColumnMap(headers) {
       if (synonyms.includes(normalized[i])) map[field] = i
     }
   }
+  console.log('column map', map, 'from headers', headers)
   return map
 }
 
@@ -65,6 +81,8 @@ export function validateRows(headers, rows, columnMap) {
     const email = cell(row, columnMap.email)
     const name = cell(row, columnMap.name) || null
     const company = cell(row, columnMap.company) || null
+    const cc = sanitizeAddressList(cell(row, columnMap.cc))
+    const bcc = sanitizeAddressList(cell(row, columnMap.bcc))
 
     // Preserve any unmapped columns so the user doesn't lose data.
     const extra = {}
@@ -96,6 +114,8 @@ export function validateRows(headers, rows, columnMap) {
       email: email || null,
       name,
       company,
+      cc,
+      bcc,
       extra,
       is_valid: errors.length === 0,
       errors,

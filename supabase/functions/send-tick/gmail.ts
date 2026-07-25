@@ -23,13 +23,18 @@ export class ConnectionError extends Error {
   }
 }
 
+export interface RefreshedToken {
+  accessToken: string
+  expiresAt: number // ms since epoch
+}
+
 /* Exchange a refresh token for a short-lived access token. Throws
    ConnectionError('revoked') when Google returns invalid_grant. */
 export async function refreshAccessToken(
   refreshToken: string,
   clientId: string,
   clientSecret: string
-): Promise<string> {
+): Promise<RefreshedToken> {
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -48,7 +53,11 @@ export async function refreshAccessToken(
     }
     throw new ConnectionError(`Token refresh failed: ${data.error || res.status}`)
   }
-  return data.access_token as string
+  const expiresInSec = Number(data.expires_in) > 0 ? Number(data.expires_in) : 3600
+  return {
+    accessToken: data.access_token as string,
+    expiresAt: Date.now() + expiresInSec * 1000,
+  }
 }
 
 // base64url-encode a UTF-8 string (Gmail wants the raw MIME in base64url).
@@ -69,18 +78,24 @@ function encodeHeader(value: string): string {
 function buildRawMessage(opts: {
   from: string
   to: string
+  cc?: string | null
+  bcc?: string | null
   subject: string
   html: string
 }): string {
-  const headers = [
-    `From: ${opts.from}`,
-    `To: ${opts.to}`,
+  const lines = [`From: ${opts.from}`, `To: ${opts.to}`]
+  // Cc/Bcc ride on this same MIME message — Gmail delivers to them in the one
+  // send call, no extra API round-trips. Bcc recipients are copied but the
+  // header is stripped from the message everyone receives.
+  if (opts.cc) lines.push(`Cc: ${opts.cc}`)
+  if (opts.bcc) lines.push(`Bcc: ${opts.bcc}`)
+  lines.push(
     `Subject: ${encodeHeader(opts.subject)}`,
     'MIME-Version: 1.0',
     'Content-Type: text/html; charset=UTF-8',
-    'Content-Transfer-Encoding: 8bit',
-  ].join('\r\n')
-  return base64UrlEncode(`${headers}\r\n\r\n${opts.html}`)
+    'Content-Transfer-Encoding: 8bit'
+  )
+  return base64UrlEncode(`${lines.join('\r\n')}\r\n\r\n${opts.html}`)
 }
 
 /* Send one email. Returns the Gmail message id. Classifies failures:
@@ -89,9 +104,10 @@ function buildRawMessage(opts: {
    - 400 and other 4xx → terminal (bad address, etc.) → mark failed */
 export async function sendEmail(
   accessToken: string,
-  opts: { from: string; to: string; subject: string; html: string }
+  opts: { from: string; to: string; cc?: string | null; bcc?: string | null; subject: string; html: string }
 ): Promise<string> {
   const raw = buildRawMessage(opts)
+  console.log("🚀 ~ sendEmail ~ raw:", raw)
   const res = await fetch(
     'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
     {
@@ -103,9 +119,11 @@ export async function sendEmail(
       body: JSON.stringify({ raw }),
     }
   )
+  console.log("🚀 ~ sendEmail ~ res:", res)
 
   if (res.ok) {
     const data = await res.json().catch(() => ({}))
+    console.log("🚀 ~ sendEmail ~ data:", data)
     return (data.id as string) || ''
   }
 

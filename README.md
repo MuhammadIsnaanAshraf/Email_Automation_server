@@ -262,20 +262,27 @@ that claims what's due and sends it via each user's Gmail token.
    capped (`users.daily_send_limit`). 50 people at 1/min → now, +1m, +2m, … These
    land as rows in `campaign_sends`. ([`src/lib/scheduleSends.js`](src/lib/scheduleSends.js))
 2. **Tick → claim.** Each minute the Edge Function calls `claim_due_sends(...)`,
-   a Postgres function that selects due rows **across all users**, caps how many
-   per user (anti-burst), and atomically flips them to `sending` with
-   `FOR UPDATE SKIP LOCKED`. Two overlapping ticks can therefore **never** grab
-   the same row → no double-sends.
-3. **Send, fairly + spaced.** Claimed rows are grouped by user; **users run
-   concurrently**, but each user's own emails go out one at a time with a small
-   gap (`SEND_INTRA_PASS_DELAY_MS`). A recipient's turn depends only on its own
+   a Postgres function that selects due rows **across all users**, but claims
+   **at most one per user per tick** (`SEND_MAX_PER_USER_PER_PASS`, default 1)
+   — so one account never bursts, even if several of its campaigns happen to
+   land a recipient on the same due slot — and atomically flips the claimed
+   row to `sending` with `FOR UPDATE SKIP LOCKED`. Two overlapping ticks can
+   therefore **never** grab the same row → no double-sends. There's no cap on
+   the total claimed in one pass; the ceiling is naturally "one per account
+   with something due". Any other due row for an account that already got its
+   pick this tick is pushed to the next minute boundary by `claim_due_sends`
+   itself and flagged via `reschedule_count` — it's never left behind with a
+   stale `scheduled_at`, and it's never recorded as sent for the slot it
+   missed.
+3. **Send, fairly.** Claimed rows are grouped by user; **users run
+   concurrently**, one send each. A recipient's turn depends only on its own
    `scheduled_at`, never on which user uploaded first.
 4. **Fail soft.** A bad address fails just that row (marked `failed`) and the
    campaign continues. Transient errors (429/5xx) and connection problems
    reschedule with backoff up to `SEND_MAX_ATTEMPTS`; a revoked grant flips the
    Gmail connection to `revoked` (so Module 1's reconnect banner shows).
 5. **Roll up.** After each pass, `refresh_campaign_progress(...)` recomputes
-   `sent_count`/`failed_count` and marks the campaign `sent` when nothing's left.
+   `sent_count`/`failed_count` and marks the campaign `completed` when nothing's left.
 
 ### API (all require a session)
 
@@ -300,8 +307,7 @@ that claims what's due and sends it via each user's Gmail token.
    supabase secrets set \
      GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... \
      TOKEN_ENCRYPTION_KEY=... SEND_TICK_SECRET=... \
-     SEND_MAX_PER_PASS=200 SEND_MAX_PER_USER_PER_PASS=5 \
-     SEND_INTRA_PASS_DELAY_MS=8000 SEND_DEFAULT_DAILY_LIMIT=400
+     SEND_MAX_PER_USER_PER_PASS=1 SEND_DEFAULT_DAILY_LIMIT=400
    ```
    (`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` are injected automatically.)
 4. **Schedule the tick:** edit [`db/05_cron_setup.sql`](db/05_cron_setup.sql),
@@ -327,8 +333,6 @@ curl -X POST https://<PROJECT_REF>.supabase.co/functions/v1/send-tick \
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `SEND_MAX_PER_PASS` | 200 | Max sends claimed in one tick (all users) |
-| `SEND_MAX_PER_USER_PER_PASS` | 5 | Anti-burst cap per account per tick |
-| `SEND_INTRA_PASS_DELAY_MS` | 8000 | Gap between one account's sends in a pass |
+| `SEND_MAX_PER_USER_PER_PASS` | 1 | Max sends claimed per account per tick (anti-burst). No total per-pass cap — it's naturally one per account with something due. |
 | `SEND_DEFAULT_DAILY_LIMIT` | 400 | Fallback per-account/day cap |
 | `SEND_MAX_ATTEMPTS` | 5 | Retries before a transient failure is marked failed |

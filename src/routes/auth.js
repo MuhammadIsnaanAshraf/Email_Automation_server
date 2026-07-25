@@ -6,6 +6,27 @@ import { GOOGLE_SCOPES } from '../config/env.js'
 
 const router = Router()
 
+/* ── Who am I ──────────────────────────────────────────────────
+   GET /auth/me
+   The single source of truth for the signed-in user's role — the frontend
+   uses this to decide whether to show/allow admin-only pages. requireAuth
+   already looked the role up; this just hands it back along with the
+   profile fields the UI needs. */
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('id, email, name, role')
+      .eq('id', req.user.id)
+      .single()
+    if (error) throw error
+    res.json(profile)
+  } catch (err) {
+    console.error('[auth/me] failed:', err)
+    res.status(500).json({ error: 'internal_error' })
+  }
+})
+
 /* ── Save the Gmail connection after sign-in ─────────────────────
    POST /auth/callback
    Called from the frontend right after it exchanges the Supabase OAuth

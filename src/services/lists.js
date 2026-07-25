@@ -52,6 +52,8 @@ async function insertDraftList({ userId, listName, filename, recipients, headers
         normalized_email: r.email ? r.email.toLowerCase().trim() : '',
         name: r.name || null,
         company: r.company || null,
+        cc: r.cc || null,
+        bcc: r.bcc || null,
         row_number: r.row_number,
         is_valid: r.is_valid,
         errors: r.errors || [],
@@ -92,8 +94,10 @@ export async function createDraftFromData({ userId, recipients, headers, columnM
    message (e.g. no email column) so the route can 4xx instead of half-saving. */
 export async function createDraftFromSheet({ userId, buffer, filename, mimetype, listName }) {
   const { headers, rows } = await parseSheet(buffer, filename, mimetype)
+  console.log("🚀 ~ createDraftFromSheet ~ rows:", rows)
 
   const columnMap = buildColumnMap(headers)
+  console.log("🚀 ~ createDraftFromSheet ~ columnMap:", columnMap)
   if (columnMap.email == null) {
     throw new ListError(
       'Could not find an email column. Make sure one column is labeled "email" (or similar). ' +
@@ -103,6 +107,7 @@ export async function createDraftFromSheet({ userId, buffer, filename, mimetype,
   }
 
   const recipients = validateRows(headers, rows, columnMap)
+  console.log("🚀 ~ createDraftFromSheet ~ recipients:", recipients)
   const validCount = recipients.filter((r) => r.is_valid).length
 
   return insertDraftList({
@@ -138,20 +143,56 @@ export async function getListForUser(userId, listId) {
   return data
 }
 
-/* Paginated recipients for a list. `filter` = 'all' | 'valid' | 'invalid'. */
-export async function getRecipients(listId, { filter = 'all', page = 1, pageSize = 50 } = {}) {
+/* Columns the client is allowed to sort by, mapped to real DB columns. */
+const SORTABLE_COLUMNS = {
+  row_number: 'row_number',
+  email: 'email',
+  name: 'name',
+  company: 'company',
+  status: 'is_valid',
+  is_valid: 'is_valid',
+}
+
+/* Escape a user search term for use inside a PostgREST `.or(...)` filter.
+   Commas and parentheses are the operator delimiters, so they'd otherwise
+   corrupt the expression; `%` and `_` are ilike wildcards. */
+function sanitizeSearch(raw) {
+  return String(raw)
+    .replace(/[,()]/g, ' ')
+    .replace(/[%_]/g, '\\$&')
+    .trim()
+}
+
+/* Paginated + filterable + searchable + sortable recipients for a list.
+   filter = 'all' | 'valid' | 'invalid'
+   search = free text matched against email / name / company (ilike)
+   sort   = one of SORTABLE_COLUMNS keys;  dir = 'asc' | 'desc'
+   All of it runs in Postgres so large lists stay fast. */
+export async function getRecipients(
+  listId,
+  { filter = 'all', page = 1, pageSize = 50, search = '', sort = 'row_number', dir = 'asc' } = {},
+) {
   const from = (page - 1) * pageSize
   const to = from + pageSize - 1
+  const sortColumn = SORTABLE_COLUMNS[sort] || 'row_number'
+  const ascending = dir !== 'desc'
 
   let query = supabase
     .from('recipients')
     .select('*', { count: 'exact' })
     .eq('list_id', listId)
+    .order(sortColumn, { ascending, nullsFirst: false })
+    // Stable secondary + tiebreak ordering so pages never overlap or drop rows.
     .order('row_number', { ascending: true })
     .range(from, to)
 
   if (filter === 'valid') query = query.eq('is_valid', true)
   else if (filter === 'invalid') query = query.eq('is_valid', false)
+
+  const term = sanitizeSearch(search)
+  if (term) {
+    query = query.or(`email.ilike.%${term}%,name.ilike.%${term}%,company.ilike.%${term}%`)
+  }
 
   const { data, error, count } = await query
   if (error) throw error
