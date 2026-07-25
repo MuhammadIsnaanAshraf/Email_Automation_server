@@ -34,6 +34,10 @@ import { refreshAccessToken, sendEmail, SendError, ConnectionError } from './gma
 const TOKEN_EXPIRY_BUFFER_MS = 60_000
 
 // ── Config (Edge Function secrets) ───────────────────────────
+// SUPABASE_URL / SERVICE_ROLE are auto-injected by the Edge runtime; the rest
+// are secrets you set with `supabase secrets set`. We read them all up front and
+// log *presence only* (never values) at cold boot, so a missing secret shows up
+// as a clear boot log instead of a silent 401 or a per-user decrypt failure.
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SERVICE_ROLE = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID')!
@@ -46,9 +50,31 @@ const MAX_PER_USER = Number(Deno.env.get('SEND_MAX_PER_USER_PER_PASS') ?? '1')
 const DEFAULT_DAILY_LIMIT = Number(Deno.env.get('SEND_DEFAULT_DAILY_LIMIT') ?? '400')
 const MAX_ATTEMPTS = Number(Deno.env.get('SEND_MAX_ATTEMPTS') ?? '5')
 
-const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, {
-  auth: { persistSession: false, autoRefreshToken: false },
+// This runs once per cold boot, at module load. If you DON'T see this line in
+// the logs, the module is crashing before it (bad import / bad env) — that is
+// the "booted then shutdown with no logs" case.
+console.log('[send-tick] module init; env present:', {
+  SUPABASE_URL: !!SUPABASE_URL,
+  SERVICE_ROLE: !!SERVICE_ROLE,
+  GOOGLE_CLIENT_ID: !!GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET: !!GOOGLE_CLIENT_SECRET,
+  TOKEN_ENCRYPTION_KEY: !!TOKEN_ENCRYPTION_KEY,
+  SEND_TICK_SECRET: !!TICK_SECRET,
 })
+
+// createClient throws at module load if the URL is empty. Do it defensively so
+// the reason lands in the logs rather than a bare "shutdown".
+function initClient() {
+  try {
+    return createClient(SUPABASE_URL, SERVICE_ROLE, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
+  } catch (err) {
+    console.error('[send-tick] FATAL: createClient failed at module init:', err)
+    throw err
+  }
+}
+const supabase = initClient()
 
 interface Send {
   id: string
@@ -240,10 +266,21 @@ async function processUserSend(
 
 // ── Entry point ──────────────────────────────────────────────
 Deno.serve(async (req) => {
+  // First line of every invocation. If this never appears but "booted" does,
+  // the request is not reaching the handler at all.
+  console.log('[send-tick] request received:', req.method, new Date().toISOString())
+
   // Shared-secret auth (the function is deployed with --no-verify-jwt; only
   // pg_cron, which knows this secret, may trigger it).
   const secret = req.headers.get('x-tick-secret')
   if (!TICK_SECRET || secret !== TICK_SECRET) {
+    // Spell out *why* it's a 401 so a missing secret vs. a mismatched one is
+    // obvious in the logs (values never logged — just whether they're set).
+    console.warn('[send-tick] 401 unauthorized:', {
+      tick_secret_configured: !!TICK_SECRET,
+      header_present: secret !== null,
+      header_matches: !!TICK_SECRET && secret === TICK_SECRET,
+    })
     return new Response(JSON.stringify({ error: 'unauthorized' }), {
       status: 401,
       headers: { 'Content-Type': 'application/json' },
@@ -257,22 +294,27 @@ Deno.serve(async (req) => {
       p_max_per_user: MAX_PER_USER,
       p_lock_ttl: '5 minutes',
     })
+    console.log("🚀 ~ claimed:", claimed)
     if (claimErr) throw claimErr
 
     const sends: Send[] = claimed || []
+    console.log("🚀 ~ sends.length:", sends.length)
     if (sends.length === 0) {
       return Response.json({ ok: true, claimed: 0 })
     }
 
     // 2) Batch-fetch the bits we need (campaign content, user + limits).
     const campaignIds = [...new Set(sends.map((s) => s.campaign_id))]
+    console.log("🚀 ~ campaignIds:", campaignIds)
     const userIds = [...new Set(sends.map((s) => s.user_id))]
+    console.log("🚀 ~ userIds:", userIds)
 
     const [{ data: campaignRows }, { data: profileRows }, { data: settingsRows }] = await Promise.all([
       supabase.from('campaigns').select('id, subject, body').in('id', campaignIds),
       supabase.from('profiles').select('id, email, name').in('id', userIds),
       supabase.from('user_settings').select('user_id, daily_send_limit').in('user_id', userIds),
     ])
+    console.log("🚀 ~ campaignRows:", campaignRows)
 
     const profiles = new Map<string, { email: string; name: string | null }>(
       (profileRows || []).map((p: { id: string; email: string; name: string | null }) => [p.id, p])
@@ -290,6 +332,7 @@ Deno.serve(async (req) => {
       ])
     )
     const users = new Map<string, { email: string; name: string | null; daily_send_limit: number }>()
+    console.log("🚀 ~ users:", users)
     for (const userId of userIds) {
       const p = profiles.get(userId)
       const limit = settings.get(userId) ?? DEFAULT_DAILY_LIMIT
@@ -319,6 +362,7 @@ Deno.serve(async (req) => {
         return processUserSend(userId, send, campaigns, user)
       })
     )
+    console.log("🚀 ~ results:", results)
 
     // Log any per-user failures and extract summaries.
     const perUser = results.map((r) => {

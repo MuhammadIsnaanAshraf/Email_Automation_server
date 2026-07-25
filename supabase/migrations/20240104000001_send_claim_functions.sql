@@ -51,6 +51,12 @@ begin
            ) as rn
     from public.campaign_sends cs
     where cs.status = 'scheduled' and cs.scheduled_at <= now()
+  ),
+  locked as (
+    select due.id, due.rn
+    from due
+    join public.campaign_sends cs on cs.id = due.id
+    where cs.status = 'scheduled'
     for update of cs skip locked
   ),
   overflow as (
@@ -58,14 +64,14 @@ begin
     set scheduled_at = v_next_slot,
         reschedule_count = cs.reschedule_count + 1,
         updated_at = now()
-    from due
-    where due.id = cs.id and due.rn > p_max_per_user
+    from locked
+    where locked.id = cs.id and locked.rn > p_max_per_user
   ),
   claimed as (
     update public.campaign_sends cs
     set status = 'sending', locked_at = now(), updated_at = now()
-    from due
-    where due.id = cs.id and due.rn <= p_max_per_user
+    from locked
+    where locked.id = cs.id and locked.rn <= p_max_per_user
     returning cs.*
   )
   select * from claimed;
