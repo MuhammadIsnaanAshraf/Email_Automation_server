@@ -192,6 +192,9 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
   // token is already cached in google_connections by the time the first send
   // is due, so the tick can reuse it instead of paying for a refresh itself.
   const token = await getValidAccessToken(userId)
+  if (token.error === 'network_error') {
+    throw new CampaignError('Could not reach Google right now. Try scheduling again in a moment.', 503)
+  }
   if (token.error) {
     throw new CampaignError('Gmail is not connected. Reconnect your account before scheduling.', 409)
   }

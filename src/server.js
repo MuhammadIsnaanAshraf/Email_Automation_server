@@ -1,7 +1,20 @@
+import dns from 'node:dns'
+import net from 'node:net'
 import express from 'express'
 import cors from 'cors'
 import cookieParser from 'cookie-parser'
 import { env } from './config/env.js'
+
+// Google's OAuth/Gmail endpoints resolve dual-stack (A + AAAA), and this host
+// has no IPv6 route at all. `ipv4first` alone isn't enough: Node's "Happy
+// Eyeballs" auto-family-selection (on by default since Node 18.13/19.4) still
+// races a v6 attempt alongside v4, and when v6 is entirely unroutable (not
+// just slow) that race can misfire and kill the whole connection attempt as
+// ETIMEDOUT in under a second — confirmed by reproducing it directly against
+// oauth2.googleapis.com. Disabling auto-family-selection makes every outbound
+// connection just use the (now IPv4-first-ordered) address, which is reliable.
+dns.setDefaultResultOrder('ipv4first')
+net.setDefaultAutoSelectFamily(false)
 import authRoutes from './routes/auth.js'
 import listRoutes from './routes/lists.js'
 import templateRoutes from './routes/templates.js'

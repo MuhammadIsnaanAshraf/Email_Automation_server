@@ -241,6 +241,7 @@ async function processUserSend(
     await markSent(send.id, messageId)
     summary.sent++
   } catch (err) {
+    console.error('[send-tick] send failed:', { userId, sendId: send.id, error: err })
     if (err instanceof SendError && err.retryable) {
       if (err.code === 'http_401') {
         // Gmail rejected the cached token outright even though our clock
@@ -252,7 +253,10 @@ async function processUserSend(
           .update({ access_token: null, token_expiry: null })
           .eq('user_id', userId)
       }
-      const outcome = await handleRetryable(send, 5 * 60 * 1000, err.code)
+      // Persist the actual Gmail error text, not just the "http_403" code —
+      // the code alone can't distinguish a From/account mismatch from a
+      // disabled API from a rate limit, all of which retry identically.
+      const outcome = await handleRetryable(send, 5 * 60 * 1000, err.message)
       outcome === 'failed' ? summary.failed++ : summary.rescheduled++
     } else {
       // Terminal (bad address, permanent 4xx): fail this one.

@@ -91,6 +91,7 @@ export async function getValidAccessToken(userId) {
   }
 
   const refreshToken = decrypt(connection.refresh_token)
+  console.log("🚀 ~ getValidAccessToken ~ refreshToken:", refreshToken)
   if (!refreshToken) {
     await markStatus(userId, 'expired', 'No refresh token on file; user must reconnect.')
     return { error: 'no_refresh_token', needsReconnect: true }
@@ -101,13 +102,16 @@ export async function getValidAccessToken(userId) {
     await saveConnection(userId, { ...credentials, refresh_token: undefined })
     return { accessToken: credentials.access_token }
   } catch (err) {
-    // invalid_grant → the user revoked access or the token expired.
-    const revoked = err?.response?.data?.error === 'invalid_grant'
-    await markStatus(
-      userId,
-      revoked ? 'revoked' : 'error',
-      err?.response?.data?.error_description || err.message
-    )
+    const code = err?.response?.data?.error
+    // invalid_grant → the user revoked access or the token expired: reconnect
+    // is genuinely required. A network_error never reached Google at all, so
+    // it says nothing about the grant — leave the connection's status alone
+    // and let the caller retry later instead of wrongly prompting reconnect.
+    if (code === 'network_error') {
+      return { error: 'network_error', needsReconnect: false }
+    }
+    const revoked = code === 'invalid_grant'
+    await markStatus(userId, revoked ? 'revoked' : 'error', err?.response?.data?.error_description || err.message)
     return { error: revoked ? 'revoked' : 'refresh_failed', needsReconnect: true }
   }
 }

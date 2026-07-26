@@ -128,6 +128,11 @@ export async function sendEmail(
   }
 
   const errBody = await res.text().catch(() => '')
+  // A 403 here is almost always Gmail rejecting the `From:` header as not
+  // owned by the authenticated account (or the Gmail API not being enabled
+  // for the project) — log the from/to alongside the body since the status
+  // code alone ("http_403") isn't enough to tell which.
+  console.error(`[gmail] send failed ${res.status} from=${opts.from} to=${opts.to}:`, errBody.slice(0, 1000))
   const retryable = res.status === 429 || res.status >= 500 || res.status === 401 || res.status === 403
   throw new SendError(`Gmail send failed (${res.status}): ${errBody.slice(0, 300)}`, {
     retryable,
