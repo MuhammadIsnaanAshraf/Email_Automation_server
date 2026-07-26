@@ -13,13 +13,19 @@ export async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'unauthorized', code: 'invalid_token' })
   }
 
-  // Role lives in `profiles`, not on the auth user itself — look it up here so
-  // every route downstream (and requireAdmin) can trust req.user.role without
-  // each one re-querying it.
-  const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).single()
-
+  // Role lives in auth.users' raw_app_meta_data (exposed here as
+  // app_metadata) — never in `profiles`. app_metadata can only be written by
+  // a service-role client (see the promotion query in
+  // 20240108000000_role_in_auth_metadata.sql), so a user can never grant
+  // themselves admin by editing their own profile row. getUser() above is a
+  // live lookup against auth.users, not a decode of the JWT's original
+  // claims, so a promotion takes effect on this user's very next request.
+  //
+  // Fall back to user_metadata.role for cases where the role was set via
+  // the Supabase Dashboard UI (which writes to raw_user_meta_data rather
+  // than raw_app_meta_data). app_metadata takes precedence.
   req.user = user
-  req.user.role = profile?.role || 'user'
+  req.user.role = user.app_metadata?.role || user.user_metadata?.role || 'user'
   req.accessToken = token
   next()
 }

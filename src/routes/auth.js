@@ -9,18 +9,18 @@ const router = Router()
 /* ── Who am I ──────────────────────────────────────────────────
    GET /auth/me
    The single source of truth for the signed-in user's role — the frontend
-   uses this to decide whether to show/allow admin-only pages. requireAuth
-   already looked the role up; this just hands it back along with the
-   profile fields the UI needs. */
+   uses this to decide whether to show/allow admin-only pages. The role
+   itself comes from auth.users' app_metadata (requireAuth already resolved
+   it onto req.user.role); `profiles` only supplies display fields here. */
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const { data: profile, error } = await supabase
       .from('profiles')
-      .select('id, email, name, role')
+      .select('id, email, name')
       .eq('id', req.user.id)
       .single()
     if (error) throw error
-    res.json(profile)
+    res.json({ ...profile, role: req.user.role })
   } catch (err) {
     console.error('[auth/me] failed:', err)
     res.status(500).json({ error: 'internal_error' })
