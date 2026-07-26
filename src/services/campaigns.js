@@ -92,6 +92,35 @@ export async function getCampaignsForUser(userId) {
   return data
 }
 
+const CAMPAIGN_SORTABLE = new Set(['name', 'status', 'total_recipients', 'sent_count', 'created_at'])
+
+export async function getCampaignsForUserPaginated(userId, { page = 1, pageSize = 50, filter = 'all', search = '', sort = 'created_at', dir = 'desc' } = {}) {
+  const sortCol = CAMPAIGN_SORTABLE.has(sort) ? sort : 'created_at'
+  const sortDir = dir === 'desc' ? { ascending: false } : { ascending: true }
+
+  let query = supabase
+    .from('campaigns')
+    .select('*, template:templates(id,name), list:recipient_lists(id,name,valid_rows)', { count: 'exact' })
+    .eq('user_id', userId)
+
+  if (filter !== 'all') {
+    query = query.eq('status', filter)
+  }
+  if (search) {
+    query = query.ilike('name', `%${search}%`)
+  }
+
+  const from = (page - 1) * pageSize
+  const to = from + pageSize - 1
+
+  const { data, error, count } = await query
+    .order(sortCol, sortDir)
+    .range(from, to)
+
+  if (error) throw error
+  return { campaigns: data || [], total: count || 0, page, pageSize, filter, search, sort, dir }
+}
+
 export async function getCampaignForUser(userId, campaignId) {
   const { data, error } = await supabase
     .from('campaigns')
@@ -332,6 +361,72 @@ export async function resumeCampaign(userId, campaignId) {
     throw new CampaignError('Only a paused campaign can be resumed.', 409)
   }
   return updateCampaignStatus(userId, campaignId, 'scheduled')
+}
+
+/* Paginated campaign sends with server-side search, filter, and sort.
+   Used by the campaign detail page to show per-recipient send status. */
+export async function getCampaignSends(userId, campaignId, { page = 1, pageSize = 50, filter = 'all', search = '', sort = 'scheduled_at', dir = 'asc' } = {}) {
+  const campaign = await getCampaignForUser(userId, campaignId)
+  if (!campaign) throw new CampaignError('Campaign not found.', 404)
+
+  const ALLOWED_SORTS = new Set(['email', 'name', 'status', 'scheduled_at', 'sent_at', 'attempts'])
+  const sortCol = ALLOWED_SORTS.has(sort) ? sort : 'scheduled_at'
+  const sortDir = dir === 'desc' ? { ascending: false } : { ascending: true }
+
+  let query = supabase
+    .from('campaign_sends')
+    .select('*', { count: 'exact' })
+    .eq('campaign_id', campaignId)
+
+  if (filter !== 'all') {
+    query = query.eq('status', filter)
+  }
+  if (search) {
+    query = query.or(`email.ilike.%${search}%,name.ilike.%${search}%`)
+  }
+
+  const from = (page - 1) * pageSize
+  const to = from + pageSize - 1
+
+  const { data, error, count } = await query
+    .order(sortCol, sortDir)
+    .range(from, to)
+
+  if (error) throw error
+  return { sends: data || [], total: count || 0, page, pageSize, filter, search, sort, dir }
+}
+
+/* Aggregate stats across all of a user's campaigns. */
+export async function getCampaignStats(userId) {
+  const { data, error } = await supabase
+    .from('campaigns')
+    .select('status, sent_count, failed_count, total_recipients')
+    .eq('user_id', userId)
+
+  if (error) throw error
+
+  let totalSent = 0
+  let totalFailed = 0
+  let totalPending = 0
+  const statusCounts = {}
+
+  for (const c of data || []) {
+    totalSent += c.sent_count || 0
+    totalFailed += c.failed_count || 0
+    if (['scheduled', 'sending', 'paused'].includes(c.status)) {
+      totalPending += Math.max(0, (c.total_recipients || 0) - (c.sent_count || 0) - (c.failed_count || 0))
+    }
+    statusCounts[c.status] = (statusCounts[c.status] || 0) + 1
+  }
+
+  return {
+    totalCampaigns: data?.length || 0,
+    totalSent,
+    totalFailed,
+    totalPending,
+    totalRecipients: data?.reduce((s, c) => s + (c.total_recipients || 0), 0) || 0,
+    statusCounts,
+  }
 }
 
 /* Cancel a campaign and drop any of its sends that haven't gone out yet.

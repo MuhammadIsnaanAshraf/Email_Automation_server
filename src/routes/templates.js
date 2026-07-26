@@ -7,6 +7,7 @@ import {
   getTemplateForUser,
   updateTemplate,
   deleteTemplate,
+  getTemplatesForUserPaginated,
 } from '../services/templates.js'
 import { getSampleRecipient } from '../services/lists.js'
 import { renderTemplate, buildContext, availableTokens } from '../lib/personalize.js'
@@ -60,12 +61,18 @@ router.post('/preview', async (req, res, next) => {
   }
 })
 
-/* ── List the user's saved templates ─────────────────────────
-   GET /templates */
+/* ── List the user's saved templates (paginated) ─────────────
+   GET /templates?search=&sort=updated_at&dir=asc&page=1&pageSize=50 */
 router.get('/', async (req, res, next) => {
   try {
-    const templates = await getTemplatesForUser(req.user.id)
-    res.json({ templates })
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
+    const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
+    const sort = ['name', 'subject', 'updated_at'].includes(req.query.sort) ? req.query.sort : 'updated_at'
+    const dir = req.query.dir === 'desc' ? 'desc' : 'asc'
+
+    const result = await getTemplatesForUserPaginated(req.user.id, { page, pageSize, search, sort, dir })
+    res.json(result)
   } catch (err) {
     next(err)
   }

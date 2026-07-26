@@ -8,6 +8,7 @@ import {
   createDraftFromData,
   createDraftFromSheet,
   getListsForUser,
+  getListsForUserPaginated,
   getListForUser,
   getRecipients,
   confirmList,
@@ -105,12 +106,18 @@ router.post('/upload', async (req, res, next) => {
   }
 })
 
-/* ── List all of the user's lists ─────────────────────────────
-   GET /lists */
+/* ── List all of the user's lists (paginated) ─────────────────
+   GET /lists?search=&sort=created_at&dir=desc&page=1&pageSize=50 */
 router.get('/', async (req, res, next) => {
   try {
-    const lists = await getListsForUser(req.user.id)
-    res.json({ lists })
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
+    const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
+    const sort = ['name', 'status', 'valid_rows', 'invalid_rows', 'created_at'].includes(req.query.sort) ? req.query.sort : 'created_at'
+    const dir = req.query.dir === 'desc' ? 'desc' : 'asc'
+
+    const result = await getListsForUserPaginated(req.user.id, { page, pageSize, search, sort, dir })
+    res.json(result)
   } catch (err) {
     next(err)
   }

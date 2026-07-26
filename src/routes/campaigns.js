@@ -4,6 +4,7 @@ import {
   CampaignError,
   createCampaign,
   getCampaignsForUser,
+  getCampaignsForUserPaginated,
   getCampaignForUser,
   getCampaignRecipients,
   updateCampaignStatus,
@@ -13,17 +14,26 @@ import {
   pauseCampaign,
   resumeCampaign,
   cancelCampaign,
+  getCampaignSends,
+  getCampaignStats,
 } from '../services/campaigns.js'
 
 const router = Router()
 router.use(requireAuth)
 
-/* ── List the user's campaigns ────────────────────────────────
-   GET /campaigns */
+/* ── List the user's campaigns (paginated) ────────────────────
+   GET /campaigns?filter=all&search=&sort=created_at&dir=desc&page=1&pageSize=50 */
 router.get('/', async (req, res, next) => {
   try {
-    const campaigns = await getCampaignsForUser(req.user.id)
-    res.json({ campaigns })
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
+    const filter = ['all', 'sending', 'paused', 'draft', 'scheduled', 'sent', 'failed', 'canceled'].includes(req.query.filter) ? req.query.filter : 'all'
+    const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
+    const sort = ['name', 'status', 'total_recipients', 'sent_count', 'created_at'].includes(req.query.sort) ? req.query.sort : 'created_at'
+    const dir = req.query.dir === 'desc' ? 'desc' : 'asc'
+
+    const result = await getCampaignsForUserPaginated(req.user.id, { page, pageSize, filter, search, sort, dir })
+    res.json(result)
   } catch (err) {
     next(err)
   }
@@ -40,6 +50,17 @@ router.post('/', async (req, res, next) => {
     res.status(201).json({ campaign })
   } catch (err) {
     if (err instanceof CampaignError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* ── Aggregate campaign stats for the current user ────────────
+   GET /campaigns/stats */
+router.get('/stats', async (req, res, next) => {
+  try {
+    const stats = await getCampaignStats(req.user.id)
+    res.json(stats)
+  } catch (err) {
     next(err)
   }
 })
@@ -102,6 +123,25 @@ router.get('/:id/progress', async (req, res, next) => {
   try {
     const progress = await getSendProgress(req.user.id, req.params.id)
     res.json(progress)
+  } catch (err) {
+    if (err instanceof CampaignError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* ── Paginated campaign sends (used by campaign detail page) ──
+   GET /campaigns/:id/sends?filter=all&search=&sort=scheduled_at&dir=asc&page=1&pageSize=50 */
+router.get('/:id/sends', async (req, res, next) => {
+  try {
+    const result = await getCampaignSends(req.user.id, req.params.id, {
+      page: Math.max(1, parseInt(req.query.page, 10) || 1),
+      pageSize: Math.min(500, Math.max(1, parseInt(req.query.pageSize, 10) || 50)),
+      filter: req.query.filter || 'all',
+      search: req.query.search || '',
+      sort: req.query.sort || 'scheduled_at',
+      dir: req.query.dir || 'asc',
+    })
+    res.json(result)
   } catch (err) {
     if (err instanceof CampaignError) return res.status(err.status).json({ error: err.message })
     next(err)

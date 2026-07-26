@@ -131,6 +131,32 @@ export async function getListsForUser(userId) {
   return data
 }
 
+const LIST_SORTABLE = new Set(['name', 'status', 'valid_rows', 'invalid_rows', 'created_at'])
+
+export async function getListsForUserPaginated(userId, { page = 1, pageSize = 50, search = '', sort = 'created_at', dir = 'desc' } = {}) {
+  const sortCol = LIST_SORTABLE.has(sort) ? sort : 'created_at'
+  const sortDir = dir === 'desc' ? { ascending: false } : { ascending: true }
+
+  let query = supabase
+    .from('recipient_lists')
+    .select('*', { count: 'exact' })
+    .eq('user_id', userId)
+
+  if (search) {
+    query = query.or(`name.ilike.%${search}%,source_filename.ilike.%${search}%`)
+  }
+
+  const from = (page - 1) * pageSize
+  const to = from + pageSize - 1
+
+  const { data, error, count } = await query
+    .order(sortCol, sortDir)
+    .range(from, to)
+
+  if (error) throw error
+  return { lists: data || [], total: count || 0, page, pageSize, search, sort, dir }
+}
+
 /* A single list, scoped to its owner. Returns null if not found / not theirs. */
 export async function getListForUser(userId, listId) {
   const { data, error } = await supabase

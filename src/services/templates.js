@@ -63,6 +63,32 @@ export async function getTemplatesForUser(userId) {
   return data
 }
 
+const TEMPLATE_SORTABLE = new Set(['name', 'subject', 'updated_at'])
+
+export async function getTemplatesForUserPaginated(userId, { page = 1, pageSize = 50, search = '', sort = 'updated_at', dir = 'asc' } = {}) {
+  const sortCol = TEMPLATE_SORTABLE.has(sort) ? sort : 'updated_at'
+  const sortDir = dir === 'desc' ? { ascending: false } : { ascending: true }
+
+  let query = supabase
+    .from('templates')
+    .select('*', { count: 'exact' })
+    .eq('user_id', userId)
+
+  if (search) {
+    query = query.or(`name.ilike.%${search}%,subject.ilike.%${search}%`)
+  }
+
+  const from = (page - 1) * pageSize
+  const to = from + pageSize - 1
+
+  const { data, error, count } = await query
+    .order(sortCol, sortDir)
+    .range(from, to)
+
+  if (error) throw error
+  return { templates: data || [], total: count || 0, page, pageSize, search, sort, dir }
+}
+
 export async function getTemplateForUser(userId, templateId) {
   const { data, error } = await supabase
     .from('templates')
