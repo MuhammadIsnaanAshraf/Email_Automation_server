@@ -242,27 +242,24 @@ async function processUserSend(
     summary.sent++
   } catch (err) {
     console.error('[send-tick] send failed:', { userId, sendId: send.id, error: err })
-    if (err instanceof SendError && err.retryable) {
-      if (err.code === 'http_401') {
-        // Gmail rejected the cached token outright even though our clock
-        // thought it still had time left — clear the cache so the next
-        // attempt is forced to mint a fresh one instead of reusing it for
-        // up to another hour.
-        await supabase
-          .from('google_connections')
-          .update({ access_token: null, token_expiry: null })
-          .eq('user_id', userId)
-      }
-      // Persist the actual Gmail error text, not just the "http_403" code —
-      // the code alone can't distinguish a From/account mismatch from a
-      // disabled API from a rate limit, all of which retry identically.
-      const outcome = await handleRetryable(send, 5 * 60 * 1000, err.message)
-      outcome === 'failed' ? summary.failed++ : summary.rescheduled++
-    } else {
-      // Terminal (bad address, permanent 4xx): fail this one.
-      await markFailed(send.id, err instanceof Error ? err.message : String(err))
-      summary.failed++
+    if (err instanceof SendError && err.code === 'http_401') {
+      // Gmail rejected the cached token outright even though our clock
+      // thought it still had time left — clear the cache so the next
+      // attempt is forced to mint a fresh one instead of reusing it for
+      // up to another hour.
+      await supabase
+        .from('google_connections')
+        .update({ access_token: null, token_expiry: null })
+        .eq('user_id', userId)
     }
+    // Any failure here — retryable SendError, terminal SendError, or an
+    // unexpected exception (rendering bug, network hiccup, etc.) — goes back
+    // into the queue with backoff rather than being marked failed outright on
+    // its first occurrence. handleRetryable's own MAX_ATTEMPTS cap is what
+    // eventually ends a row's life as 'failed', not the error's shape.
+    const message = err instanceof Error ? err.message : String(err)
+    const outcome = await handleRetryable(send, 5 * 60 * 1000, message)
+    outcome === 'failed' ? summary.failed++ : summary.rescheduled++
   }
 
   return summary
