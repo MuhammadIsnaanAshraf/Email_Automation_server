@@ -18,6 +18,7 @@ export const env = {
   isProd: (process.env.NODE_ENV || 'development') === 'production',
 
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
+  adminUrl: process.env.ADMIN_URL || 'http://localhost:5174',
   backendUrl: process.env.BACKEND_URL || 'http://localhost:4000',
 
   google: {

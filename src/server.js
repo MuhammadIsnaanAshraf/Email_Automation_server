@@ -24,9 +24,19 @@ const app = express()
 
 app.set('trust proxy', 1)
 
+// Two separate SPAs call this API (the main app and the admin console), each
+// on its own origin/port — a single hardcoded `origin` here would silently
+// CORS-block whichever one isn't listed (the browser fails the request
+// before it's even sent, so it shows up downstream as an inexplicable auth
+// failure, not a CORS error).
+const ALLOWED_ORIGINS = [env.frontendUrl, env.adminUrl]
 app.use(
   cors({
-    origin: env.frontendUrl,
+    origin: (origin, callback) => {
+      // No Origin header (curl, server-to-server, same-origin) — allow.
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true)
+      callback(new Error(`CORS: origin ${origin} not allowed`))
+    },
     credentials: true,
   })
 )
