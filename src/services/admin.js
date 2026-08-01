@@ -1,5 +1,7 @@
 import { supabase } from '../lib/supabase.js'
-import { getSubscriptionStatus } from './subscriptions.js'
+import { env, clampGapSeconds } from '../config/env.js'
+import { getSubscriptionStatus, toStatus } from './subscriptions.js'
+import { getUserSendSettings } from './campaigns.js'
 
 export class AdminError extends Error {
   constructor(message, status = 400) {
@@ -11,10 +13,29 @@ export class AdminError extends Error {
 
 const ALLOWED_USER_SORTS = ['email', 'name', 'created_at']
 
+/* Same shape getUserSendSettings() returns, built from a user_settings row so
+   the admin list can render pacing without one query per user. */
+function sendSettingsFromRow(row) {
+  const defaultGap = env.sending.defaultGapSeconds
+  return {
+    dailyLimit: row?.daily_send_limit > 0 ? row.daily_send_limit : 400,
+    gapSeconds: row?.send_gap_seconds != null
+      ? clampGapSeconds(row.send_gap_seconds, defaultGap)
+      : defaultGap,
+    gapIsCustom: row?.send_gap_seconds != null,
+    platformDefaultGapSeconds: defaultGap,
+  }
+}
+
 export async function listUsers({ page = 1, pageSize = 50, search = '', sort = 'created_at', dir = 'desc' }) {
+  // One round trip via the admin_user_list view (see migration
+  // 20240114000000_admin_user_list_view.sql): it LEFT JOINs profiles with
+  // google_connections, user_settings and user_subscription_status, so the
+  // page's data all comes back in a single PostgREST call. Only the auth
+  // lookup for role/avatar stays separate — that's the GoTrue Admin API.
   let query = supabase
-    .from('profiles')
-    .select('id, email, name, created_at', { count: 'exact' })
+    .from('admin_user_list')
+    .select('*', { count: 'exact' })
 
   if (search) {
     query = query.or(`email.ilike.%${search}%,name.ilike.%${search}%`)
@@ -25,35 +46,38 @@ export async function listUsers({ page = 1, pageSize = 50, search = '', sort = '
     .order(sortField, { ascending: dir !== 'desc' })
     .range((page - 1) * pageSize, page * pageSize - 1)
 
-  const { data: profiles, count, error } = await query
+  const [rowsRes, authRes] = await Promise.all([
+    query,
+    supabase.auth.admin.listUsers({ perPage: 1000 }),
+  ])
+  const { data: rows, count, error } = rowsRes
   if (error) throw new AdminError(error.message, 500)
 
-  if (!profiles || profiles.length === 0) {
+  if (!rows || rows.length === 0) {
     return { users: [], total: 0, page, pageSize }
   }
-
-  const ids = profiles.map((p) => p.id)
-
-  const [authRes, connectionsRes] = await Promise.all([
-    supabase.auth.admin.listUsers({ perPage: 1000 }),
-    supabase.from('google_connections').select('user_id, status, token_expiry').in('user_id', ids),
-  ])
 
   const authMap = {}
   for (const u of authRes.data?.users || []) authMap[u.id] = u
 
-  const connMap = {}
-  for (const c of connectionsRes.data || []) connMap[c.user_id] = c
-
-  const users = profiles.map((p) => {
-    const au = authMap[p.id]
-    const conn = connMap[p.id]
+  const users = rows.map((r) => {
+    const au = authMap[r.id]
     return {
-      ...p,
+      id: r.id,
+      email: r.email,
+      name: r.name,
+      whatsappNumber: r.whatsapp_number,
+      created_at: r.created_at,
       role: au?.app_metadata?.role || au?.user_metadata?.role || 'user',
       avatarUrl: au?.user_metadata?.avatar_url || au?.user_metadata?.picture || null,
-      gmailConnected: conn?.status === 'connected',
-      tokenExpiry: conn?.token_expiry || null,
+      gmailConnected: r.gmail_status === 'connected',
+      tokenExpiry: r.token_expiry || null,
+      // period_end is null exactly when the user has never paid — hand toStatus
+      // null in that case so it reports "never subscribed" instead of an epoch.
+      subscription: r.period_end ? toStatus(r) : toStatus(null),
+      // View columns match what sendSettingsFromRow reads (daily_send_limit,
+      // send_gap_seconds), so the raw row works directly.
+      sendSettings: sendSettingsFromRow(r),
     }
   })
 
@@ -74,10 +98,11 @@ export async function getUser(id) {
 
   const { data: { user } } = await supabase.auth.admin.getUserById(id).catch(() => ({ data: { user: null } }))
 
-  const [campaignsRes, sendsRes, subscription] = await Promise.all([
+  const [campaignsRes, sendsRes, subscription, sendSettings] = await Promise.all([
     supabase.from('campaigns').select('*', { count: 'exact', head: true }).eq('user_id', id),
     supabase.from('campaign_sends').select('*', { count: 'exact', head: true }).eq('user_id', id),
     getSubscriptionStatus(id),
+    getUserSendSettings(id),
   ])
 
   const { data: connection } = await supabase
@@ -94,7 +119,34 @@ export async function getUser(id) {
     campaignCount: campaignsRes.count || 0,
     totalSends: sendsRes.count || 0,
     subscription,
+    sendSettings: { ...sendSettings, platformDefaultGapSeconds: env.sending.defaultGapSeconds },
   }
+}
+
+/* Set (or clear) this account's send-gap override. Passing null/'' clears it,
+   putting the account back on the platform default — that's why "no override"
+   is a distinct state rather than just writing the default value in. */
+export async function updateUserSendSettings(id, { sendGapSeconds }) {
+  const value = sendGapSeconds === null || sendGapSeconds === '' || sendGapSeconds === undefined
+    ? null
+    : clampGapSeconds(sendGapSeconds, null)
+
+  if (sendGapSeconds != null && sendGapSeconds !== '' && value === null) {
+    throw new AdminError('Send gap must be a number between 1 and 86400 seconds.', 422)
+  }
+
+  // upsert, not update: user_settings rows are created by a signup trigger,
+  // but an account that predates it (or had its row removed) would otherwise
+  // silently no-op here.
+  const { error } = await supabase
+    .from('user_settings')
+    .upsert(
+      { user_id: id, send_gap_seconds: value, updated_at: new Date().toISOString() },
+      { onConflict: 'user_id' }
+    )
+  if (error) throw new AdminError(error.message, 500)
+
+  return getUserSendSettings(id)
 }
 
 export async function getSystemStats() {

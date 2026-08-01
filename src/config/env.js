@@ -36,6 +36,25 @@ export const env = {
 
   tokenEncryptionKey: required('TOKEN_ENCRYPTION_KEY'),
   sessionTtlDays: Number(process.env.SESSION_TTL_DAYS || 30),
+
+  sending: {
+    // Platform-wide fallback gap between two consecutive emails, in seconds.
+    // Used when a campaign carries no explicit frequency AND the account has
+    // no per-user override (user_settings.send_gap_seconds). 120s matches the
+    // "1 every 2 minutes" that used to be hardcoded in the frontend, so
+    // existing behaviour is unchanged until someone configures otherwise.
+    defaultGapSeconds: clampGapSeconds(process.env.SEND_DEFAULT_GAP_SECONDS, 120),
+  },
+}
+
+/* Keep any gap (env or per-user) inside the same sane window the DB check
+   constraint enforces: at least 1s, at most 24h. A junk/absent env value
+   falls back to `fallback` rather than silently becoming NaN and producing
+   Invalid Date send times downstream. */
+export function clampGapSeconds(value, fallback = 120) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 1) return fallback
+  return Math.min(Math.floor(n), 86400)
 }
 
 /* The single OAuth scope set we request. Login (identity) + Gmail send are

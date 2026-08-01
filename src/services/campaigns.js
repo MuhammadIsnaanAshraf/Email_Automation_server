@@ -1,4 +1,5 @@
 import { supabase } from '../lib/supabase.js'
+import { env, clampGapSeconds } from '../config/env.js'
 import { extractVariables } from '../lib/personalize.js'
 import { computeSendTimes, frequencyToIntervalSeconds } from '../lib/scheduleSends.js'
 import { getListForUser, getRecipients } from './lists.js'
@@ -183,9 +184,52 @@ export async function deleteCampaign(userId, campaignId) {
 
 const SENDS_INSERT_CHUNK = 1000
 
-async function getUserDailyLimit(userId) {
-  const { data } = await supabase.from('user_settings').select('daily_send_limit').eq('user_id', userId).single()
-  return data?.daily_send_limit && data.daily_send_limit > 0 ? data.daily_send_limit : 400
+/* Both pacing knobs for an account in one round-trip. `gapSeconds` falls back
+   to the platform default when the account has no override on file (NULL),
+   so callers always get a concrete, usable number. */
+export async function getUserSendSettings(userId) {
+  const { data } = await supabase
+    .from('user_settings')
+    .select('daily_send_limit, send_gap_seconds')
+    .eq('user_id', userId)
+    .maybeSingle()
+
+  return {
+    dailyLimit: data?.daily_send_limit > 0 ? data.daily_send_limit : 400,
+    gapSeconds: data?.send_gap_seconds != null
+      ? clampGapSeconds(data.send_gap_seconds, env.sending.defaultGapSeconds)
+      : env.sending.defaultGapSeconds,
+    // Whether the gap above came from this account's own override or the
+    // platform default — the admin UI shows the difference.
+    gapIsCustom: data?.send_gap_seconds != null,
+  }
+}
+
+/* A frequency object only counts as "explicitly requested" if it actually
+   carries a number. `{}` (which is what a campaign created without one
+   stores) is an object too, so a plain truthiness check would treat it as a
+   real request and silently pin the campaign to the library default instead
+   of falling through to the account's configured gap. */
+function pickExplicitFrequency(frequency) {
+  if (!frequency || typeof frequency !== 'object') return null
+  const hasEvery = Number(frequency.every) > 0
+  const hasCount = Number(frequency.count) > 0
+  return hasEvery || hasCount ? frequency : null
+}
+
+/* The pacing decision, isolated from all I/O so it can be reasoned about (and
+   tested) on its own. Priority: an explicit per-schedule frequency, then the
+   one the campaign was created with, then the account's configured gap.
+   Returns both the interval to space sends by and the frequency object to
+   persist — which always describes the gap ACTUALLY used, so a campaign
+   record stays truthful even if the account's gap changes later. */
+export function resolveSendInterval({ optsFrequency, campaignFrequency, userGapSeconds }) {
+  const explicit = pickExplicitFrequency(optsFrequency) || pickExplicitFrequency(campaignFrequency)
+  const intervalSeconds = explicit ? frequencyToIntervalSeconds(explicit) : userGapSeconds
+  return {
+    intervalSeconds,
+    frequency: explicit || { count: 1, every: intervalSeconds, unit: 'seconds' },
+  }
 }
 
 /* Page through every VALID recipient of a list (the ones that actually get
@@ -206,8 +250,11 @@ async function loadAllValidRecipients(listId) {
    This is the moment the whole timeline is decided; the background tick just
    sends whatever is due. Idempotent-guarded: refuses if sends already exist.
 
-   opts: { startAt?, frequency?, dailyLimit? } — all optional; frequency falls
-   back to the campaign's stored frequency, dailyLimit to the user's account cap. */
+   opts: { startAt?, frequency?, dailyLimit? } — all optional. The gap between
+   sends is resolved in priority order: an explicit `frequency` here → the one
+   stored on the campaign at create time → the account's configured
+   send_gap_seconds → SEND_DEFAULT_GAP_SECONDS. dailyLimit likewise falls back
+   to the account's cap. */
 export async function scheduleCampaign(userId, campaignId, opts = {}) {
   const campaign = await getCampaignForUser(userId, campaignId)
   if (!campaign) throw new CampaignError('Campaign not found.', 404)
@@ -242,10 +289,15 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     throw new CampaignError('That list has no valid recipients to send to.', 422)
   }
 
-  const frequency =
-    opts.frequency && typeof opts.frequency === 'object' ? opts.frequency : campaign.frequency || {}
-  const intervalSeconds = frequencyToIntervalSeconds(frequency)
-  const dailyLimit = Number(opts.dailyLimit) > 0 ? Number(opts.dailyLimit) : await getUserDailyLimit(userId)
+  // Gap resolution: explicit request → campaign's own → account's configured
+  // gap → platform default (the last two already collapsed into gapSeconds).
+  const settings = await getUserSendSettings(userId)
+  const { intervalSeconds, frequency } = resolveSendInterval({
+    optsFrequency: opts.frequency,
+    campaignFrequency: campaign.frequency,
+    userGapSeconds: settings.gapSeconds,
+  })
+  const dailyLimit = Number(opts.dailyLimit) > 0 ? Number(opts.dailyLimit) : settings.dailyLimit
   const startAt = opts.startAt ? new Date(opts.startAt) : new Date()
   if (Number.isNaN(startAt.getTime())) throw new CampaignError('Invalid start time.', 422)
 

@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { AdminError, listUsers, getUser, getSystemStats, getSystemLogs, listTemplates, getTemplate, listAdminLists, getListRecipients, listAdminCampaigns, getCampaignSends, listAllSends } from '../services/admin.js'
+import { AdminError, listUsers, getUser, updateUserSendSettings, getSystemStats, getSystemLogs, listTemplates, getTemplate, listAdminLists, getListRecipients, listAdminCampaigns, getCampaignSends, listAllSends } from '../services/admin.js'
 import { SubscriptionError, listUsersWithSubscriptions, getSubscriptionHistory, activateSubscription, setWhatsappNumber } from '../services/subscriptions.js'
 import { requireAuth, requireAdmin } from '../middleware/supabaseAuth.js'
 
@@ -28,6 +28,22 @@ router.get('/users/:id', async (req, res, next) => {
     const user = await getUser(req.params.id)
     if (!user) return res.status(404).json({ error: 'user_not_found' })
     res.json(user)
+  } catch (err) {
+    if (err instanceof AdminError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* PATCH /admin/users/:id/send-settings   { sendGapSeconds }
+   Per-account pacing override. Send `null` to clear it and fall back to the
+   platform-wide SEND_DEFAULT_GAP_SECONDS. Applies to campaigns scheduled
+   from here on; already-scheduled sends keep the times they were given. */
+router.patch('/users/:id/send-settings', async (req, res, next) => {
+  try {
+    const settings = await updateUserSendSettings(req.params.id, {
+      sendGapSeconds: req.body?.sendGapSeconds,
+    })
+    res.json({ sendSettings: settings })
   } catch (err) {
     if (err instanceof AdminError) return res.status(err.status).json({ error: err.message })
     next(err)

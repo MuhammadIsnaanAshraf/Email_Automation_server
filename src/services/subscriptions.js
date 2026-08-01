@@ -15,7 +15,7 @@ const SUBSCRIPTION_PERIOD_DAYS = 30
    paid) into the shape both the admin and user-facing UIs want: a plain
    active/expired flag plus a signed day-count so callers don't each redo
    this arithmetic (and don't each pick a different rounding rule). */
-function toStatus(row) {
+export function toStatus(row) {
   if (!row) {
     return {
       active: false,
