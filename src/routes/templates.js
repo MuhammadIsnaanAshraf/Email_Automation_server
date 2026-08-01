@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { requireAuth } from '../middleware/supabaseAuth.js'
+import { requireActiveSubscription } from '../middleware/subscription.js'
 import {
   TemplateError,
   createTemplate,
@@ -79,8 +80,9 @@ router.get('/', async (req, res, next) => {
 })
 
 /* ── Create a template ────────────────────────────────────────
-   POST /templates   { name, subject, body } */
-router.post('/', async (req, res, next) => {
+   POST /templates   { name, subject, body }
+   Gated: authoring templates is a paid feature. */
+router.post('/', requireActiveSubscription, async (req, res, next) => {
   try {
     const template = await createTemplate(req.user.id, req.body || {})
     res.status(201).json({ template })

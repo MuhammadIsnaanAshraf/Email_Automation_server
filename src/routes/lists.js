@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import multer from 'multer'
 import { requireAuth } from '../middleware/supabaseAuth.js'
+import { requireActiveSubscription } from '../middleware/subscription.js'
 import { SheetParseError } from '../lib/parseSheet.js'
 import { ISSUE_LABELS } from '../lib/validateRecipients.js'
 import {
@@ -52,8 +53,9 @@ function decorate(recipient) {
 
 /* ── Upload parsed data (client-side parsed) ───────────────────
    POST /lists/upload   { name, recipients, headers, columnMap }
-   Accepts JSON with already-parsed and validated rows from the frontend. */
-router.post('/upload', async (req, res, next) => {
+   Accepts JSON with already-parsed and validated rows from the frontend.
+   Gated: importing a recipient list is a paid feature. */
+router.post('/upload', requireActiveSubscription, async (req, res, next) => {
   try {
     console.log("req.body", req.body)
     const { name, recipients, headers, columnMap } = req.body

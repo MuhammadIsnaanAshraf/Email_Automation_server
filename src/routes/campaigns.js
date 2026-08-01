@@ -1,7 +1,6 @@
 import { Router } from 'express'
 import { requireAuth } from '../middleware/supabaseAuth.js'
 import { requireActiveSubscription } from '../middleware/subscription.js'
-import { hasActiveSubscription } from '../services/subscriptions.js'
 import {
   CampaignError,
   createCampaign,
@@ -45,8 +44,9 @@ router.get('/', async (req, res, next) => {
    POST /campaigns
    { name?, templateId?, subject?, body?, listId, scheduledAt?, frequency? }
    This is the handoff point to the sending module: it produces a self-contained
-   campaign record (snapshotted content + recipient count). */
-router.post('/', async (req, res, next) => {
+   campaign record (snapshotted content + recipient count). Gated: building
+   campaigns is a paid feature. */
+router.post('/', requireActiveSubscription, async (req, res, next) => {
   try {
     const campaign = await createCampaign(req.user.id, req.body || {})
     res.status(201).json({ campaign })
@@ -95,16 +95,15 @@ router.get('/:id/recipients', async (req, res, next) => {
 
 /* ── Change status (pause / resume / cancel; sender uses this too) ──
    PATCH /campaigns/:id/status   { status } */
-router.patch('/:id/status', async (req, res, next) => {
-  try {
+router.patch('/:id/status', (req, res, next) => {
     // This generic status route is also how the queue UI resumes a paused
     // campaign (status: 'sending') — the same real "start sending" action
     // POST /:id/schedule and /:id/resume gate below, so it needs the same
     // check, or a paused campaign would be an unguarded bypass around it.
-    if (req.body?.status === 'sending' && req.user.role !== 'admin') {
-      const active = await hasActiveSubscription(req.user.id)
-      if (!active) return res.status(402).json({ error: 'subscription_required', code: 'subscription_expired' })
-    }
+    if (req.body?.status === 'sending') return requireActiveSubscription(req, res, next)
+    next()
+  }, async (req, res, next) => {
+  try {
     const campaign = await updateCampaignStatus(req.user.id, req.params.id, req.body?.status)
     res.json({ campaign })
   } catch (err) {

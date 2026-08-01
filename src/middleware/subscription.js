@@ -10,7 +10,10 @@ export async function requireActiveSubscription(req, res, next) {
 
     const active = await hasActiveSubscription(req.user.id)
     if (!active) {
-      return res.status(402).json({ error: 'subscription_required', code: 'subscription_expired' })
+      return res.status(402).json({
+        error: 'subscription_required',
+        message: 'An active subscription is required to use this feature. Subscribe or renew to continue.',
+      })
     }
     next()
   } catch (err) {
