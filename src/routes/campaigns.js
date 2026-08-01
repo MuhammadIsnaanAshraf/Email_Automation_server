@@ -1,5 +1,7 @@
 import { Router } from 'express'
 import { requireAuth } from '../middleware/supabaseAuth.js'
+import { requireActiveSubscription } from '../middleware/subscription.js'
+import { hasActiveSubscription } from '../services/subscriptions.js'
 import {
   CampaignError,
   createCampaign,
@@ -95,6 +97,14 @@ router.get('/:id/recipients', async (req, res, next) => {
    PATCH /campaigns/:id/status   { status } */
 router.patch('/:id/status', async (req, res, next) => {
   try {
+    // This generic status route is also how the queue UI resumes a paused
+    // campaign (status: 'sending') — the same real "start sending" action
+    // POST /:id/schedule and /:id/resume gate below, so it needs the same
+    // check, or a paused campaign would be an unguarded bypass around it.
+    if (req.body?.status === 'sending' && req.user.role !== 'admin') {
+      const active = await hasActiveSubscription(req.user.id)
+      if (!active) return res.status(402).json({ error: 'subscription_required', code: 'subscription_expired' })
+    }
     const campaign = await updateCampaignStatus(req.user.id, req.params.id, req.body?.status)
     res.json({ campaign })
   } catch (err) {
@@ -107,7 +117,7 @@ router.patch('/:id/status', async (req, res, next) => {
    POST /campaigns/:id/schedule   { startAt?, frequency?, dailyLimit? }
    Materializes a per-recipient send time for the whole list up front and hands
    the campaign off to the background sending engine. */
-router.post('/:id/schedule', async (req, res, next) => {
+router.post('/:id/schedule', requireActiveSubscription, async (req, res, next) => {
   try {
     const result = await scheduleCampaign(req.user.id, req.params.id, req.body || {})
     res.status(201).json(result)
@@ -158,7 +168,7 @@ router.post('/:id/pause', async (req, res, next) => {
   }
 })
 
-router.post('/:id/resume', async (req, res, next) => {
+router.post('/:id/resume', requireActiveSubscription, async (req, res, next) => {
   try {
     res.json({ campaign: await resumeCampaign(req.user.id, req.params.id) })
   } catch (err) {
