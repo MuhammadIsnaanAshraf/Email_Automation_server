@@ -46,7 +46,7 @@ app.use(
 app.use(express.json())
 app.use(cookieParser())
 
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'flowstate-backend' }))
+app.get('/health', (_req, res) => res.json({ ok: true, service: 'zenviqo-backend' }))
 
 app.use('/auth', authRoutes)
 app.use('/lists', listRoutes)
@@ -62,5 +62,5 @@ app.use((err, _req, res, _next) => {
 })
 
 app.listen(env.port, () => {
-  console.log(`FlowState backend listening on ${env.backendUrl} (port ${env.port})`)
+  console.log(`Zenviqo backend listening on ${env.backendUrl} (port ${env.port})`)
 })

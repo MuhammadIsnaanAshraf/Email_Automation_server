@@ -15,7 +15,7 @@
 // 2. Meta Business Manager → Account tools → Message Templates: create a
 //    template (Category: Utility) with ONE body variable, e.g.:
 //      Name: subscription_expiring
-//      Body: "Hi! Your FlowState subscription expires in {{1}} day(s) on
+//      Body: "Hi! Your Zenviqo subscription expires in {{1}} day(s) on
 //             {{2}}. Reply here or contact us to renew and keep sending."
 //    Submit for review — approval is usually within minutes to a few hours.
 // 3. Set these Edge Function secrets (`supabase secrets set NAME=value`):

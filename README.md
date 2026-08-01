@@ -1,6 +1,6 @@
-# FlowState Backend
+# Zenviqo Backend
 
-Express API for the FlowState product. Modules implemented so far:
+Express API for the Zenviqo product. Modules implemented so far:
 
 - **Module 1 — Authentication:** login + Gmail-send authorization in one Google
   consent.

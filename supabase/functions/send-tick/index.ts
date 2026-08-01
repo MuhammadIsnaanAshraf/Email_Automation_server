@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────
-// FlowState — Module 4: Sending Engine tick (Supabase Edge Function)
+// Zenviqo — Module 4: Sending Engine tick (Supabase Edge Function)
 //
 // Invoked ~every minute by pg_cron (see backend/db/05_cron_setup.sql). Each run:
 //   1. Atomically CLAIMS due sends across ALL users (claim_due_sends), capping

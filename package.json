@@ -1,9 +1,9 @@
 {
-  "name": "flowstate-backend",
+  "name": "zenviqo-backend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "FlowState backend — auth API (Google OAuth + Gmail send) with Supabase.",
+  "description": "Zenviqo backend — auth API (Google OAuth + Gmail send) with Supabase.",
   "main": "src/server.js",
   "scripts": {
     "dev": "node --watch src/server.js",

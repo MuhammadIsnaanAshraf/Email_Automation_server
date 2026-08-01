@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────
-// FlowState — Module 5: Subscription reminder tick (Supabase Edge Function)
+// Zenviqo — Module 5: Subscription reminder tick (Supabase Edge Function)
 //
 // Invoked once a day by pg_cron (see backend/supabase/migrations/
 // 20240111000000_subscription_reminder_cron.sql). Each run:
