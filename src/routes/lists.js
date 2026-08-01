@@ -15,6 +15,7 @@ import {
   confirmList,
   renameList,
   deleteList,
+  getListUsage,
 } from '../services/lists.js'
 
 const router = Router()
@@ -125,6 +126,22 @@ router.get('/', async (req, res, next) => {
   }
 })
 
+/* ── List usage ───────────────────────────────────────────────
+   GET /lists/:id/usage
+   How the user's campaigns reference this list (grouped by status) and whether
+   any of them pin it — the delete flow uses this to decide whether deletion is
+   allowed. */
+router.get('/:id/usage', async (req, res, next) => {
+  try {
+    const list = await getListForUser(req.user.id, req.params.id)
+    if (!list) return res.status(404).json({ error: 'list_not_found' })
+    const usage = await getListUsage(req.user.id, req.params.id)
+    res.json({ usage })
+  } catch (err) {
+    next(err)
+  }
+})
+
 /* ── Get one list + its recipients (paginated / filterable) ───
    GET /lists/:id?filter=all|valid|invalid&page=1&pageSize=50 */
 router.get('/:id', async (req, res, next) => {
@@ -184,11 +201,24 @@ router.patch('/:id', async (req, res, next) => {
 })
 
 /* ── Delete a list ────────────────────────────────────────────
-   DELETE /lists/:id */
+   DELETE /lists/:id
+   Refuses when scheduled/sending/completed campaigns still reference the list —
+   campaigns hold a live reference (cascade delete), so deleting would wipe them
+   and their send history. */
 router.delete('/:id', async (req, res, next) => {
   try {
     const list = await getListForUser(req.user.id, req.params.id)
     if (!list) return res.status(404).json({ error: 'list_not_found' })
+
+    const usage = await getListUsage(req.user.id, req.params.id)
+    if (usage.blocked) {
+      return res.status(409).json({
+        error: 'list_in_use',
+        message: 'This list is used by scheduled, sending, or completed campaigns and can’t be deleted.',
+        usage,
+      })
+    }
+
     await deleteList(req.user.id, req.params.id)
     res.json({ ok: true })
   } catch (err) {

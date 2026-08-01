@@ -143,7 +143,7 @@ export async function getCampaignRecipients(userId, campaignId, { page = 1, page
   return { campaign, recipients, total }
 }
 
-const ALLOWED_STATUS = new Set(['draft', 'scheduled', 'sending', 'sent', 'paused', 'failed', 'canceled'])
+const ALLOWED_STATUS = new Set(['draft', 'scheduled', 'sending', 'paused', 'completed', 'failed', 'canceled'])
 
 /* Status transition — used by the frontend (pause/schedule) and, later, the
    sending module (sending → sent/failed). Stamps started_at / completed_at. */
@@ -154,7 +154,7 @@ export async function updateCampaignStatus(userId, campaignId, status) {
 
   const patch = { status, updated_at: new Date().toISOString() }
   if (status === 'sending' && !existing.started_at) patch.started_at = new Date().toISOString()
-  if (status === 'sent' || status === 'failed' || status === 'canceled') {
+  if (status === 'completed' || status === 'failed' || status === 'canceled') {
     patch.completed_at = new Date().toISOString()
   }
 
@@ -202,6 +202,7 @@ export async function getUserSendSettings(userId) {
     // Whether the gap above came from this account's own override or the
     // platform default — the admin UI shows the difference.
     gapIsCustom: data?.send_gap_seconds != null,
+    platformDefaultGapSeconds: env.sending.defaultGapSeconds,
   }
 }
 
@@ -259,7 +260,7 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
   const campaign = await getCampaignForUser(userId, campaignId)
   if (!campaign) throw new CampaignError('Campaign not found.', 404)
   if (!campaign.list_id) throw new CampaignError('Campaign has no recipient list.', 422)
-  if (['sending', 'sent'].includes(campaign.status)) {
+  if (['sending', 'completed'].includes(campaign.status)) {
     throw new CampaignError(`Campaign is already ${campaign.status}.`, 409)
   }
 

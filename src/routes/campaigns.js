@@ -28,7 +28,7 @@ router.get('/', async (req, res, next) => {
   try {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1)
     const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
-    const filter = ['all', 'sending', 'paused', 'draft', 'scheduled', 'sent', 'failed', 'canceled'].includes(req.query.filter) ? req.query.filter : 'all'
+    const filter = ['all', 'sending', 'paused', 'draft', 'scheduled', 'completed', 'failed', 'canceled'].includes(req.query.filter) ? req.query.filter : 'all'
     const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
     const sort = ['name', 'status', 'total_recipients', 'sent_count', 'created_at'].includes(req.query.sort) ? req.query.sort : 'created_at'
     const dir = req.query.dir === 'desc' ? 'desc' : 'asc'

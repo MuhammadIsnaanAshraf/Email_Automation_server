@@ -5,6 +5,7 @@ import {
   describeColumnMap,
   validateRows,
 } from '../lib/validateRecipients.js'
+import { BLOCKED_REFERENCE_STATUSES } from './templates.js'
 
 /* Batch-insert size for the recipients table. Supabase/PostgREST handles large
    inserts, but we chunk to keep request payloads reasonable. */
@@ -266,6 +267,27 @@ export async function deleteList(userId, listId) {
     .eq('id', listId)
     .eq('user_id', userId)
   if (error) throw error
+}
+
+/* How the user's campaigns reference this list, grouped by status, plus whether
+   any of them pin it (blocking deletion). Unlike templates, campaigns hold a
+   LIVE reference to the list (list_id, on delete cascade), so deleting a list
+   would silently take its campaigns and send history down with it. */
+export async function getListUsage(userId, listId) {
+  const { data, error } = await supabase
+    .from('campaigns')
+    .select('status')
+    .eq('list_id', listId)
+    .eq('user_id', userId)
+  if (error) throw error
+
+  const byStatus = {}
+  let blockedCount = 0
+  for (const c of data || []) {
+    byStatus[c.status] = (byStatus[c.status] || 0) + 1
+    if (BLOCKED_REFERENCE_STATUSES.includes(c.status)) blockedCount++
+  }
+  return { byStatus, blockedCount, blocked: blockedCount > 0 }
 }
 
 /* One representative recipient from a user's list, for template previews —

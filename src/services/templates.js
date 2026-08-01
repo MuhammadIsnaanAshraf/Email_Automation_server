@@ -63,7 +63,7 @@ export async function getTemplatesForUser(userId) {
   return data
 }
 
-const TEMPLATE_SORTABLE = new Set(['name', 'subject', 'updated_at'])
+const TEMPLATE_SORTABLE = new Set(['name', 'subject', 'updated_at', 'created_at'])
 
 export async function getTemplatesForUserPaginated(userId, { page = 1, pageSize = 50, search = '', sort = 'updated_at', dir = 'asc' } = {}) {
   const sortCol = TEMPLATE_SORTABLE.has(sort) ? sort : 'updated_at'
@@ -141,4 +141,30 @@ export async function deleteTemplate(userId, templateId) {
     .eq('id', templateId)
     .eq('user_id', userId)
   if (error) throw error
+}
+
+/* Campaign statuses that pin a template in place: as long as a campaign is
+   scheduled, sending, or completed, deleting the template it was built from is
+   blocked. Draft/paused/canceled campaigns keep their own snapshot of the
+   subject+body, so they don't lock the template. */
+export const BLOCKED_REFERENCE_STATUSES = ['scheduled', 'sending', 'completed']
+
+/* How the user's campaigns reference this template, grouped by status, plus
+   whether any of them pin it (blocking deletion). Used by the delete flow to
+   explain — and by the backend DELETE to enforce. */
+export async function getTemplateUsage(userId, templateId) {
+  const { data, error } = await supabase
+    .from('campaigns')
+    .select('status')
+    .eq('template_id', templateId)
+    .eq('user_id', userId)
+  if (error) throw error
+
+  const byStatus = {}
+  let blockedCount = 0
+  for (const c of data || []) {
+    byStatus[c.status] = (byStatus[c.status] || 0) + 1
+    if (BLOCKED_REFERENCE_STATUSES.includes(c.status)) blockedCount++
+  }
+  return { byStatus, blockedCount, blocked: blockedCount > 0 }
 }
