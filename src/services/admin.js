@@ -1,6 +1,6 @@
 import { supabase } from '../lib/supabase.js'
 import { env, clampGapSeconds } from '../config/env.js'
-import { getSubscriptionStatus, toStatus } from './subscriptions.js'
+import { getSubscriptionStatus, hasUsedTrial, toStatus } from './subscriptions.js'
 import { getUserSendSettings } from './campaigns.js'
 
 export class AdminError extends Error {
@@ -78,6 +78,7 @@ export async function listUsers({ page = 1, pageSize = 50, search = '', sort = '
       // View columns match what sendSettingsFromRow reads (daily_send_limit,
       // send_gap_seconds), so the raw row works directly.
       sendSettings: sendSettingsFromRow(r),
+      trialUsed: !!r.trial_used,
     }
   })
 
@@ -98,11 +99,12 @@ export async function getUser(id) {
 
   const { data: { user } } = await supabase.auth.admin.getUserById(id).catch(() => ({ data: { user: null } }))
 
-  const [campaignsRes, sendsRes, subscription, sendSettings] = await Promise.all([
+  const [campaignsRes, sendsRes, subscription, sendSettings, trialUsed] = await Promise.all([
     supabase.from('campaigns').select('*', { count: 'exact', head: true }).eq('user_id', id),
     supabase.from('campaign_sends').select('*', { count: 'exact', head: true }).eq('user_id', id),
     getSubscriptionStatus(id),
     getUserSendSettings(id),
+    hasUsedTrial(id),
   ])
 
   const { data: connection } = await supabase
@@ -120,6 +122,7 @@ export async function getUser(id) {
     totalSends: sendsRes.count || 0,
     subscription,
     sendSettings: { ...sendSettings, platformDefaultGapSeconds: env.sending.defaultGapSeconds },
+    trialUsed,
   }
 }
 

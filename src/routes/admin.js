@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { AdminError, listUsers, getUser, updateUserSendSettings, getSystemStats, getSystemLogs, listTemplates, getTemplate, listAdminLists, getListRecipients, listAdminCampaigns, getCampaignSends, listAllSends } from '../services/admin.js'
-import { SubscriptionError, listUsersWithSubscriptions, getSubscriptionHistory, activateSubscription, setWhatsappNumber } from '../services/subscriptions.js'
+import { SubscriptionError, listUsersWithSubscriptions, getSubscriptionHistory, activateSubscription, startTrial, setWhatsappNumber } from '../services/subscriptions.js'
 import { requireAuth, requireAdmin } from '../middleware/supabaseAuth.js'
 
 const router = Router()
@@ -238,6 +238,27 @@ router.post('/subscriptions/:userId/activate', async (req, res, next) => {
       amount,
       currency,
       paymentMethod,
+      note,
+      activatedBy: req.user.id,
+    })
+    res.status(201).json({ payment })
+  } catch (err) {
+    if (err instanceof SubscriptionError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* POST /admin/subscriptions/:userId/start-trial   { days, note? }
+   Grants a free trial — 30-day-rule's sibling for onboarding. Rejects with
+   409 if this account has ever had a trial before, or currently has an
+   active subscription (paid or trial) already. */
+router.post('/subscriptions/:userId/start-trial', async (req, res, next) => {
+  try {
+    const { days, note } = req.body || {}
+    console.log("🚀 ~ days:", days)
+    const payment = await startTrial({
+      userId: req.params.userId,
+      days,
       note,
       activatedBy: req.user.id,
     })

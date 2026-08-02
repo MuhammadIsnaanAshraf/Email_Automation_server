@@ -10,6 +10,8 @@ export class SubscriptionError extends Error {
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const SUBSCRIPTION_PERIOD_DAYS = 30
+const TRIAL_PAYMENT_METHOD = 'trial'
+const MAX_TRIAL_DAYS = 365
 
 /* Turn a user_subscription_status row (or null, for a user who has never
    paid) into the shape both the admin and user-facing UIs want: a plain
@@ -27,6 +29,7 @@ export function toStatus(row) {
       amount: null,
       currency: null,
       paymentMethod: null,
+      isTrial: false,
       lastActivatedAt: null,
     }
   }
@@ -47,6 +50,7 @@ export function toStatus(row) {
     amount: row.amount,
     currency: row.currency,
     paymentMethod: row.payment_method,
+    isTrial: row.payment_method === TRIAL_PAYMENT_METHOD,
     lastActivatedAt: row.last_activated_at,
   }
 }
@@ -122,6 +126,80 @@ export async function activateSubscription({ userId, amount, currency = 'PKR', p
   return data
 }
 
+/* Lifetime check, not a per-period one: does this user have a trial row
+   ANYWHERE in their history, active or long since expired. The ledger is
+   append-only, so this is permanent — there is no code path that lets a
+   second trial row ever get inserted once the first exists. */
+export async function hasUsedTrial(userId) {
+  const { count, error } = await supabase
+    .from('subscription_payments')
+    .select('id', { count: 'exact', head: true })
+    .eq('user_id', userId)
+    .eq('payment_method', TRIAL_PAYMENT_METHOD)
+  if (error) throw new SubscriptionError(error.message, 500)
+  return (count || 0) > 0
+}
+
+/* Grant a free trial: `days` from today, recorded as an ordinary
+   subscription_payments row (amount 0, payment_method 'trial') so every
+   other part of the system — real-time access checks, the admin listing,
+   the WhatsApp expiry reminders — treats it exactly like a paid period and
+   needs no special-casing. When it lapses, the user is "expired" the same
+   way a paid subscription would be: no separate trial-expiry state exists.
+
+   Two guards, both permanent business rules rather than incidental checks:
+   - Already used a trial (ever) → refuse. This is the "once only" rule.
+   - Currently has an active subscription (paid or trial) → refuse. Trials
+     are for accounts that aren't currently paying customers; granting one
+     on top of an active period would just be a free unadvertised extension. */
+export async function startTrial({ userId, days, note, activatedBy }) {
+  if (!userId) throw new SubscriptionError('userId is required.', 422)
+  const daysNum = Number(days)
+  if (!Number.isInteger(daysNum) || daysNum < 1 || daysNum > MAX_TRIAL_DAYS) {
+    throw new SubscriptionError(`Trial length must be a whole number of days between 1 and ${MAX_TRIAL_DAYS}.`, 422)
+  }
+
+  const { data: profile, error: profileErr } = await supabase
+    .from('profiles')
+    .select('id')
+    .eq('id', userId)
+    .maybeSingle()
+  if (profileErr) throw new SubscriptionError(profileErr.message, 500)
+  if (!profile) throw new SubscriptionError('User not found.', 404)
+
+  if (await hasUsedTrial(userId)) {
+    throw new SubscriptionError('This user has already used their free trial.', 409)
+  }
+
+  const latest = await getLatestPayment(userId)
+  const now = new Date()
+  const currentExpiry = latest ? new Date(latest.period_end) : null
+  if (currentExpiry && currentExpiry.getTime() > now.getTime()) {
+    throw new SubscriptionError('This user already has an active subscription — trials are only for accounts without one.', 409)
+  }
+
+  const periodStart = now
+  const periodEnd = new Date(periodStart.getTime() + daysNum * DAY_MS)
+
+  const { data, error } = await supabase
+    .from('subscription_payments')
+    .insert({
+      user_id: userId,
+      amount: 0,
+      currency: 'PKR',
+      payment_method: TRIAL_PAYMENT_METHOD,
+      note: note?.trim() || `${daysNum}-day free trial`,
+      period_start: periodStart.toISOString(),
+      period_end: periodEnd.toISOString(),
+      activated_by: activatedBy || null,
+    })
+    .select()
+    .single()
+  if (error) throw new SubscriptionError(error.message, 500)
+
+  return data
+}
+
 export async function getSubscriptionHistory(userId, { page = 1, pageSize = 20 } = {}) {
   const from = (page - 1) * pageSize
   const to = from + pageSize - 1
@@ -167,14 +245,16 @@ export async function listUsersWithSubscriptions({ page = 1, pageSize = 50, sear
   }
 
   const ids = profiles.map((p) => p.id)
-  const { data: statusRows, error: statusErr } = await supabase
-    .from('user_subscription_status')
-    .select('*')
-    .in('user_id', ids)
+  const [{ data: statusRows, error: statusErr }, { data: trialRows, error: trialErr }] = await Promise.all([
+    supabase.from('user_subscription_status').select('*').in('user_id', ids),
+    supabase.from('subscription_payments').select('user_id').eq('payment_method', TRIAL_PAYMENT_METHOD).in('user_id', ids),
+  ])
   if (statusErr) throw new SubscriptionError(statusErr.message, 500)
+  if (trialErr) throw new SubscriptionError(trialErr.message, 500)
 
   const statusMap = {}
   for (const row of statusRows || []) statusMap[row.user_id] = row
+  const trialUsedSet = new Set((trialRows || []).map((r) => r.user_id))
 
   let users = profiles.map((p) => ({
     id: p.id,
@@ -183,6 +263,7 @@ export async function listUsersWithSubscriptions({ page = 1, pageSize = 50, sear
     whatsappNumber: p.whatsapp_number,
     createdAt: p.created_at,
     subscription: toStatus(statusMap[p.id] || null),
+    trialUsed: trialUsedSet.has(p.id),
   }))
 
   if (filter === 'active') users = users.filter((u) => u.subscription.active)
