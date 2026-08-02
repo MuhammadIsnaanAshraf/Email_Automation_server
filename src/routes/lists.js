@@ -2,6 +2,7 @@ import { Router } from 'express'
 import multer from 'multer'
 import { requireAuth } from '../middleware/supabaseAuth.js'
 import { requireActiveSubscription } from '../middleware/subscription.js'
+import { requireActiveAccount } from '../middleware/accountStatus.js'
 import { SheetParseError } from '../lib/parseSheet.js'
 import { ISSUE_LABELS } from '../lib/validateRecipients.js'
 import {
@@ -39,7 +40,7 @@ const upload = multer({
   },
 })
 
-router.use(requireAuth)
+router.use(requireAuth, requireActiveAccount)
 
 function decorate(recipient) {
   return {

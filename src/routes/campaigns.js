@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { requireAuth } from '../middleware/supabaseAuth.js'
 import { requireActiveSubscription } from '../middleware/subscription.js'
+import { requireActiveAccount } from '../middleware/accountStatus.js'
 import {
   CampaignError,
   createCampaign,
@@ -20,7 +21,7 @@ import {
 } from '../services/campaigns.js'
 
 const router = Router()
-router.use(requireAuth)
+router.use(requireAuth, requireActiveAccount)
 
 /* ── List the user's campaigns (paginated) ────────────────────
    GET /campaigns?filter=all&search=&sort=created_at&dir=desc&page=1&pageSize=50 */

@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { requireAuth } from '../middleware/supabaseAuth.js'
 import { requireActiveSubscription } from '../middleware/subscription.js'
+import { requireActiveAccount } from '../middleware/accountStatus.js'
 import {
   TemplateError,
   createTemplate,
@@ -15,7 +16,7 @@ import { getSampleRecipient } from '../services/lists.js'
 import { renderTemplate, buildContext, availableTokens } from '../lib/personalize.js'
 
 const router = Router()
-router.use(requireAuth)
+router.use(requireAuth, requireActiveAccount)
 
 /* ── Live preview ─────────────────────────────────────────────
    POST /templates/preview   { subject, body, listId? }

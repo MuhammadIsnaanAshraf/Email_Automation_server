@@ -8,10 +8,14 @@ const router = Router()
 
 /* ── Who am I ──────────────────────────────────────────────────
    GET /auth/me
-   The single source of truth for the signed-in user's role — the frontend
-   uses this to decide whether to show/allow admin-only pages. The role
-   itself comes from auth.users' app_metadata (requireAuth already resolved
-   it onto req.user.role); `profiles` only supplies display fields here. */
+   The single source of truth for the signed-in user's role AND account
+   status — the frontend uses this to decide whether to show admin-only
+   pages, and whether to show the "account inactive" screen instead of the
+   portal. Both come from auth.users' app_metadata (requireAuth already
+   resolved them onto req.user); `profiles` only supplies display fields
+   here. Deliberately NOT gated by requireActiveAccount — an inactive user
+   still needs this to succeed so the frontend can learn *why* it's blocked,
+   rather than getting a bare 403 with nothing to render. */
 router.get('/me', requireAuth, async (req, res) => {
   try {
     const { data: profile, error } = await supabase
@@ -20,7 +24,7 @@ router.get('/me', requireAuth, async (req, res) => {
       .eq('id', req.user.id)
       .single()
     if (error) throw error
-    res.json({ ...profile, role: req.user.role })
+    res.json({ ...profile, role: req.user.role, accountStatus: req.user.status })
   } catch (err) {
     console.error('[auth/me] failed:', err)
     res.status(500).json({ error: 'internal_error' })

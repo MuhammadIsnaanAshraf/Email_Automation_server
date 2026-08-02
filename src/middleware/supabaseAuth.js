@@ -26,6 +26,12 @@ export async function requireAuth(req, res, next) {
   // than raw_app_meta_data). app_metadata takes precedence.
   req.user = user
   req.user.role = user.app_metadata?.role || user.user_metadata?.role || 'user'
+  // Same source, same reasoning as role: only a service-role client (i.e. a
+  // manual SQL UPDATE, never the app) can ever set this to 'inactive' — see
+  // 20240116000000_account_status.sql. Defaults to 'active' so accounts
+  // created before this migration, or missing the field for any reason,
+  // aren't accidentally locked out.
+  req.user.status = user.app_metadata?.status || 'active'
   req.accessToken = token
   next()
 }

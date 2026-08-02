@@ -69,6 +69,9 @@ export async function listUsers({ page = 1, pageSize = 50, search = '', sort = '
       whatsappNumber: r.whatsapp_number,
       created_at: r.created_at,
       role: au?.app_metadata?.role || au?.user_metadata?.role || 'user',
+      // Read-only here — deliberately no endpoint sets this. Only a manual
+      // SQL UPDATE against auth.users does (20240116000000_account_status.sql).
+      accountStatus: au?.app_metadata?.status || 'active',
       avatarUrl: au?.user_metadata?.avatar_url || au?.user_metadata?.picture || null,
       gmailConnected: r.gmail_status === 'connected',
       tokenExpiry: r.token_expiry || null,
@@ -116,6 +119,8 @@ export async function getUser(id) {
   return {
     ...profile,
     role: user?.app_metadata?.role || user?.user_metadata?.role || 'user',
+    // Read-only — see the note in listUsers() above.
+    accountStatus: user?.app_metadata?.status || 'active',
     avatarUrl: user?.user_metadata?.avatar_url || user?.user_metadata?.picture || null,
     gmailConnected: connection?.status === 'connected',
     campaignCount: campaignsRes.count || 0,
