@@ -154,7 +154,7 @@ router.get('/:id', async (req, res, next) => {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1)
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
     const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
-    const sort = ['row_number', 'email', 'name', 'company', 'status', 'is_valid'].includes(req.query.sort)
+    const sort = ['row_number', 'email', 'name', 'website', 'company', 'status', 'is_valid'].includes(req.query.sort)
       ? req.query.sort : 'row_number'
     const dir = req.query.dir === 'desc' ? 'desc' : 'asc'
 

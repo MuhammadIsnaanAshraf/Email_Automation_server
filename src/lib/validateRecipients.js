@@ -7,7 +7,7 @@
 const FIELD_SYNONYMS = {
   email: ['email', 'e mail', 'email address', 'mail', 'recipient', 'recipient email', 'to', 'work email'],
   name: ['name', 'full name', 'contact', 'contact name', 'recipient name', 'first name', 'person'],
-  company: ['company', 'company name', 'organization', 'organisation', 'org', 'business', 'account'],
+  website: ['website', 'web site', 'site', 'url', 'website url', 'web address', 'domain', 'company website', 'company', 'company name', 'organization', 'organisation', 'org', 'business', 'account'],
   cc: ['cc', 'carbon copy', 'copy', 'cc email', 'cc emails'],
   bcc: ['bcc', 'blind carbon copy', 'blind copy', 'bcc email', 'bcc emails'],
 }
@@ -38,10 +38,10 @@ function normalizeHeader(h) {
 }
 
 /* Decide which column index feeds each field. First matching header wins.
-   Returns { email, name, company } as column indexes (or null if not found). */
+   Returns { email, name, website } as column indexes (or null if not found). */
 export function buildColumnMap(headers) {
   const normalized = headers.map(normalizeHeader)
-  const map = { email: null, name: null, company: null, cc: null, bcc: null }
+  const map = { email: null, name: null, website: null, cc: null, bcc: null }
 
   for (const [field, synonyms] of Object.entries(FIELD_SYNONYMS)) {
     for (let i = 0; i < normalized.length; i++) {
@@ -54,7 +54,7 @@ export function buildColumnMap(headers) {
 }
 
 /* A human-readable version of the mapping for the preview UI, e.g.
-   { email: "Email Address", name: "Full Name", company: null } */
+   { email: "Email Address", name: "Full Name", website: null } */
 export function describeColumnMap(headers, columnMap) {
   const described = {}
   for (const field of Object.keys(columnMap)) {
@@ -80,7 +80,7 @@ export function validateRows(headers, rows, columnMap) {
   return rows.map((row, i) => {
     const email = cell(row, columnMap.email)
     const name = cell(row, columnMap.name) || null
-    const company = cell(row, columnMap.company) || null
+    const website = cell(row, columnMap.website) || null
     const cc = sanitizeAddressList(cell(row, columnMap.cc))
     const bcc = sanitizeAddressList(cell(row, columnMap.bcc))
 
@@ -113,7 +113,7 @@ export function validateRows(headers, rows, columnMap) {
       row_number: i + 1,
       email: email || null,
       name,
-      company,
+      website,
       cc,
       bcc,
       extra,

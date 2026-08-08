@@ -27,7 +27,7 @@ router.use(requireAuth, requireActiveAccount)
 const FALLBACK_SAMPLE = {
   email: 'jordan.lee@example.com',
   name: 'Jordan Lee',
-  company: 'Acme Inc',
+  website: 'acme.com',
   extra: { city: 'San Francisco' },
 }
 
@@ -55,7 +55,7 @@ router.post('/preview', async (req, res, next) => {
       sample: {
         email: recipient.email,
         name: recipient.name,
-        company: recipient.company,
+        website: recipient.website || recipient.company,
         ...buildContext(recipient),
       },
     })

@@ -310,7 +310,9 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     recipient_id: r.id,
     email: r.email,
     name: r.name,
-    company: r.company,
+    // Recipients expose the mapped column as `website`; campaign_sends keeps
+    // the historical `company` column, so map website → company on snapshot.
+    company: r.website || r.company,
     cc: r.cc || null,
     bcc: r.bcc || null,
     // Recipient rows store the extra columns as `extra_data`; the send snapshot

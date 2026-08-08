@@ -36,7 +36,7 @@ export function extractVariables(...texts) {
 }
 
 /* Turn a recipient row (from the `recipients` table) into a flat map of token →
-   value. Provides the mapped columns (email/name/company), sensible derived
+   value. Provides the mapped columns (email/name/website), sensible derived
    tokens (first_name/last_name), and every unmapped column from `extra`. */
 export function buildContext(recipient = {}) {
   const ctx = {}
@@ -48,7 +48,9 @@ export function buildContext(recipient = {}) {
   put('email', recipient.email)
   put('name', recipient.name)
   put('full_name', recipient.name)
-  put('company', recipient.company)
+  // The mapped column is exposed as {{website}}; the DB column is still
+  // `company`, so read that fallback for older rows.
+  put('website', recipient.website || recipient.company)
 
   // Derive first / last name from a full name.
   if (recipient.name) {

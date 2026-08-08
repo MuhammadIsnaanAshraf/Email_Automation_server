@@ -14,6 +14,7 @@ function normalizeToken(token: string): string {
 export interface RecipientLike {
   email?: string | null
   name?: string | null
+  website?: string | null
   company?: string | null
   extra?: Record<string, unknown> | null
 }
@@ -28,7 +29,7 @@ function buildContext(recipient: RecipientLike): Record<string, string> {
   put('email', recipient.email)
   put('name', recipient.name)
   put('full_name', recipient.name)
-  put('company', recipient.company)
+  put('website', recipient.website || recipient.company)
 
   if (recipient.name) {
     const parts = String(recipient.name).trim().split(/\s+/)

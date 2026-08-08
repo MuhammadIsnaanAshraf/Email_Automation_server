@@ -173,7 +173,7 @@ router.get('/lists/:id/recipients', async (req, res, next) => {
     const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
     const filter = ['all', 'valid', 'invalid'].includes(req.query.filter) ? req.query.filter : 'all'
     const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
-    const sort = ['row_number', 'email', 'name', 'company', 'is_valid'].includes(req.query.sort) ? req.query.sort : 'row_number'
+    const sort = ['row_number', 'email', 'name', 'website', 'company', 'is_valid'].includes(req.query.sort) ? req.query.sort : 'row_number'
     const dir = req.query.dir === 'desc' ? 'desc' : 'asc'
 
     const result = await getListRecipients(req.params.id, { page, pageSize, filter, search, sort, dir })

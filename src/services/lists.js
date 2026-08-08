@@ -52,7 +52,9 @@ async function insertDraftList({ userId, listName, filename, recipients, headers
         email: r.email,
         normalized_email: r.email ? r.email.toLowerCase().trim() : '',
         name: r.name || null,
-        company: r.company || null,
+        // Frontend now labels the mapped column "website"; the DB column stays
+        // `company`, so map website → company on save.
+        company: r.website || r.company || null,
         cc: r.cc || null,
         bcc: r.bcc || null,
         row_number: r.row_number,
@@ -175,6 +177,7 @@ const SORTABLE_COLUMNS = {
   row_number: 'row_number',
   email: 'email',
   name: 'name',
+  website: 'company',
   company: 'company',
   status: 'is_valid',
   is_valid: 'is_valid',
@@ -223,7 +226,10 @@ export async function getRecipients(
 
   const { data, error, count } = await query
   if (error) throw error
-  return { recipients: data, total: count ?? 0, page, pageSize }
+  // DB column is `company`; expose it as `website` so the UI/personalization
+  // reads one name everywhere.
+  const recipients = (data || []).map((r) => ({ ...r, website: r.website || r.company }))
+  return { recipients, total: count ?? 0, page, pageSize }
 }
 
 /* Confirm a draft → 'ready'. Refuses if there isn't at least one valid row,

@@ -402,7 +402,7 @@ export async function listAllSends({ page = 1, pageSize = 50, campaignName = '',
   return { sends: enriched, total: count || 0, page, pageSize, campaignName, userSearch, status }
 }
 
-const ALLOWED_RECIPIENT_SORTS = ['row_number', 'email', 'name', 'company', 'is_valid']
+const ALLOWED_RECIPIENT_SORTS = ['row_number', 'email', 'name', 'website', 'company', 'is_valid']
 
 export async function getListRecipients(listId, { page = 1, pageSize = 50, filter = 'all', search = '', sort = 'row_number', dir = 'asc' } = {}) {
   const { data: list, error: listErr } = await supabase
