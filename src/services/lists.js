@@ -1,5 +1,5 @@
 import { supabase } from '../lib/supabase.js'
-import { parseSheet } from '../lib/parseSheet.js'
+import { parseSheet, MAX_ROWS } from '../lib/parseSheet.js'
 import {
   buildColumnMap,
   describeColumnMap,
@@ -10,6 +10,12 @@ import { BLOCKED_REFERENCE_STATUSES } from './templates.js'
 /* Batch-insert size for the recipients table. Supabase/PostgREST handles large
    inserts, but we chunk to keep request payloads reasonable. */
 const INSERT_CHUNK = 1000
+
+/* A sheet row can expand into several recipients (multiple address columns), so
+   the row limit enforced at parse time isn't a bound on what gets inserted.
+   Both entry points funnel through insertDraftList, so this is the one place
+   that has to hold the line. */
+const MAX_RECIPIENTS = MAX_ROWS
 
 export class ListError extends Error {
   constructor(message, status = 400) {
@@ -23,6 +29,15 @@ export class ListError extends Error {
    Used by both createDraftFromSheet (server-side parse) and createDraftFromData
    (client-side parse). */
 async function insertDraftList({ userId, listName, filename, recipients, headers, columnMap }) {
+  if (recipients.length > MAX_RECIPIENTS) {
+    throw new ListError(
+      `This file produces ${recipients.length.toLocaleString()} recipients, which is over the ` +
+        `${MAX_RECIPIENTS.toLocaleString()} limit. Rows containing several email addresses become ` +
+        'one recipient each, so a wide sheet can expand well past its row count. Split it and upload in parts.',
+      422
+    )
+  }
+
   const columnMapDescription = describeColumnMap(headers, columnMap)
   const validCount = recipients.filter((r) => r.is_valid).length
   const invalidCount = recipients.length - validCount

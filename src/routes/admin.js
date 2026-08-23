@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { AdminError, listUsers, getUser, updateUserSendSettings, getSystemStats, getSystemLogs, listTemplates, getTemplate, listAdminLists, getListRecipients, listAdminCampaigns, getCampaignSends, listAllSends } from '../services/admin.js'
+import { AdminError, listUsers, getUser, updateUserSendSettings, getSystemStats, getSystemLogs, listTemplates, getTemplate, listAdminLists, getListRecipients, listAdminCampaigns, countUpcomingCampaigns, getCampaignSends, listAllSends } from '../services/admin.js'
 import { SubscriptionError, listUsersWithSubscriptions, getSubscriptionHistory, activateSubscription, startTrial, setWhatsappNumber } from '../services/subscriptions.js'
 import { requireAuth, requireAdmin } from '../middleware/supabaseAuth.js'
 
@@ -138,11 +138,19 @@ router.get('/campaigns', async (req, res, next) => {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1)
     const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
     const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
-    const sort = ['name', 'status', 'total_recipients', 'sent_count', 'created_at'].includes(req.query.sort) ? req.query.sort : 'created_at'
+    const status = ['all', 'upcoming', 'draft', 'scheduled', 'sending', 'paused', 'completed', 'canceled', 'failed']
+      .includes(req.query.status) ? req.query.status : 'all'
+    const sort = ['name', 'status', 'total_recipients', 'sent_count', 'created_at', 'scheduled_at'].includes(req.query.sort)
+      ? req.query.sort : 'created_at'
     const dir = req.query.dir === 'desc' ? 'desc' : 'asc'
 
-    const result = await listAdminCampaigns({ page, pageSize, search, sort, dir })
-    res.json(result)
+    // The upcoming count is view-wide, not page-wide, so it stays meaningful
+    // while paging or filtering.
+    const [result, upcoming] = await Promise.all([
+      listAdminCampaigns({ page, pageSize, search, status, sort, dir }),
+      countUpcomingCampaigns(),
+    ])
+    res.json({ ...result, upcoming })
   } catch (err) {
     if (err instanceof AdminError) return res.status(err.status).json({ error: err.message })
     next(err)

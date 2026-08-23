@@ -273,27 +273,53 @@ export async function listAdminLists({ page = 1, pageSize = 50, search = '', sor
   return { lists: await attachOwner(lists || []), total: count || 0, page, pageSize }
 }
 
-const ALLOWED_CAMPAIGN_SORTS = ['name', 'status', 'total_recipients', 'sent_count', 'failed_count', 'created_at', 'updated_at']
+const ALLOWED_CAMPAIGN_SORTS = ['name', 'status', 'total_recipients', 'sent_count', 'failed_count', 'created_at', 'updated_at', 'scheduled_at']
+const CAMPAIGN_STATUSES = ['draft', 'scheduled', 'sending', 'paused', 'completed', 'canceled', 'failed']
 const ALLOWED_SEND_SORTS = ['email', 'name', 'status', 'attempts', 'scheduled_at', 'sent_at']
 
-export async function listAdminCampaigns({ page = 1, pageSize = 50, search = '', sort = 'created_at', dir = 'desc' } = {}) {
+/* `status` narrows to one campaign status; the pseudo-status 'upcoming' means
+   "booked for a moment that hasn't arrived yet", which is the question an admin
+   actually asks — a campaign can sit at 'scheduled' while already mid-delivery
+   on a big list, so status alone doesn't answer it. */
+export async function listAdminCampaigns({ page = 1, pageSize = 50, search = '', status = 'all', sort = 'created_at', dir = 'desc' } = {}) {
   let query = supabase
     .from('campaigns')
-    .select('id, user_id, name, status, total_recipients, sent_count, failed_count, scheduled_at, created_at, updated_at', { count: 'exact' })
+    .select('id, user_id, name, status, total_recipients, sent_count, failed_count, scheduled_at, started_at, created_at, updated_at', { count: 'exact' })
 
   if (search) {
     query = query.ilike('name', `%${search}%`)
   }
+  if (status === 'upcoming') {
+    query = query
+      .in('status', ['scheduled', 'paused'])
+      .gt('scheduled_at', new Date().toISOString())
+  } else if (CAMPAIGN_STATUSES.includes(status)) {
+    query = query.eq('status', status)
+  }
 
   const sortField = ALLOWED_CAMPAIGN_SORTS.includes(sort) ? sort : 'created_at'
   query = query
-    .order(sortField, { ascending: dir !== 'desc' })
+    // Booked campaigns are only useful in time order, so default that view to
+    // soonest-first regardless of the caller's default sort.
+    .order(sortField, { ascending: dir !== 'desc', nullsFirst: false })
     .range((page - 1) * pageSize, page * pageSize - 1)
 
   const { data: campaigns, count, error } = await query
   if (error) throw new AdminError(error.message, 500)
 
-  return { campaigns: await attachOwner(campaigns || []), total: count || 0, page, pageSize }
+  return { campaigns: await attachOwner(campaigns || []), total: count || 0, page, pageSize, status }
+}
+
+/* How many campaigns are booked for a future moment, across every account —
+   the headline number for the admin campaigns view. */
+export async function countUpcomingCampaigns() {
+  const { count, error } = await supabase
+    .from('campaigns')
+    .select('id', { count: 'exact', head: true })
+    .in('status', ['scheduled', 'paused'])
+    .gt('scheduled_at', new Date().toISOString())
+  if (error) throw new AdminError(error.message, 500)
+  return count || 0
 }
 
 export async function getCampaignSends(campaignId, { page = 1, pageSize = 50, filter = 'all', search = '', sort = 'scheduled_at', dir = 'asc' } = {}) {

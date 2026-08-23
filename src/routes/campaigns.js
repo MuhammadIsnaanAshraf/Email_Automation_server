@@ -12,6 +12,7 @@ import {
   updateCampaignStatus,
   deleteCampaign,
   scheduleCampaign,
+  rescheduleCampaign,
   getSendProgress,
   pauseCampaign,
   resumeCampaign,
@@ -116,11 +117,33 @@ router.patch('/:id/status', (req, res, next) => {
 /* ── Schedule a campaign (Module 4) ───────────────────────────
    POST /campaigns/:id/schedule   { startAt?, frequency?, dailyLimit? }
    Materializes a per-recipient send time for the whole list up front and hands
-   the campaign off to the background sending engine. */
+   the campaign off to the background sending engine.
+
+   `startAt` is an ISO instant. Omit it to start sending immediately (the
+   original behaviour); pass one to book the campaign for a future day/time. */
 router.post('/:id/schedule', requireActiveSubscription, async (req, res, next) => {
   try {
-    const result = await scheduleCampaign(req.user.id, req.params.id, req.body || {})
+    // `replace` is an internal flag owned by rescheduleCampaign, which checks
+    // that nothing has been sent first. Accepting it from the client would let
+    // anyone wipe a running campaign's outbox, so it's stripped here.
+    const { replace: _ignored, ...opts } = req.body || {}
+    const result = await scheduleCampaign(req.user.id, req.params.id, opts)
     res.status(201).json(result)
+  } catch (err) {
+    if (err instanceof CampaignError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* ── Move a booked campaign to a different time ───────────────
+   PATCH /campaigns/:id/schedule   { startAt?, frequency?, dailyLimit? }
+   Only valid while the campaign hasn't sent anything yet; the old outbox is
+   discarded and rebuilt around the new start time. */
+router.patch('/:id/schedule', requireActiveSubscription, async (req, res, next) => {
+  try {
+    const { replace: _ignored, ...opts } = req.body || {}
+    const result = await rescheduleCampaign(req.user.id, req.params.id, opts)
+    res.json(result)
   } catch (err) {
     if (err instanceof CampaignError) return res.status(err.status).json({ error: err.message })
     next(err)

@@ -22,7 +22,17 @@ export class CampaignError extends Error {
    - If templateId is given, its subject/body are used (unless subject/body are
      also explicitly provided, which override — e.g. the user tweaked a loaded
      template before scheduling).
-   - The list must belong to the user and have at least one valid recipient. */
+   - The list must belong to the user and have at least one valid recipient.
+   - `scheduledAt` (ISO instant) books the campaign in the same step: the send
+     timeline is materialized immediately, exactly as if the user had created a
+     draft and then pressed play with that time. Omit it for a plain draft.
+
+   Booking is all-or-nothing. Scheduling can legitimately fail after the row
+   exists (Gmail disconnected, list emptied), and a campaign left sitting at
+   status 'scheduled' with an empty outbox would never send and never complete —
+   it would just lie in the queue forever. So a failed booking deletes the row it
+   just created and rethrows: the caller either gets a scheduled campaign or gets
+   an error, never a half-made one. */
 export async function createCampaign(userId, input = {}) {
   const { templateId = null, listId, scheduledAt = null, frequency = {} } = input
   console.log("🚀 ~ createCampaign ~ frequency:", frequency)
@@ -31,6 +41,11 @@ export async function createCampaign(userId, input = {}) {
   console.log("🚀 ~ createCampaign ~ templateId:", templateId)
 
   if (!listId) throw new CampaignError('A recipient list is required.', 422)
+
+  // Reject a bad time before creating anything, so an unusable timestamp can't
+  // leave a stray campaign behind. Also tells us whether this is a real booking
+  // or just "now", which is the same as no schedule at all.
+  const { isScheduled: wantsSchedule } = normalizeStartAt(scheduledAt)
 
   const list = await getListForUser(userId, listId)
   if (!list) throw new CampaignError('Recipient list not found.', 404)
@@ -58,7 +73,9 @@ export async function createCampaign(userId, input = {}) {
     String(input.name || '').trim() ||
     `${template?.name || 'Campaign'} → ${list.name}`
 
-  const status = scheduledAt ? 'scheduled' : 'draft'
+  // Always born a draft. scheduleCampaign below is what promotes it, and only
+  // once the outbox actually exists to back the promise.
+  const status = 'draft'
 
   const { data, error } = await supabase
     .from('campaigns')
@@ -72,13 +89,24 @@ export async function createCampaign(userId, input = {}) {
       variables: extractVariables(subject, body),
       total_recipients: list.valid_rows,
       status,
-      scheduled_at: scheduledAt,
+      scheduled_at: null,
       frequency: frequency && typeof frequency === 'object' ? frequency : {},
     })
     .select()
     .single()
   if (error) throw error
-  return data
+
+  if (!wantsSchedule) return data
+
+  try {
+    const { campaign } = await scheduleCampaign(userId, data.id, { startAt: scheduledAt, frequency })
+    return campaign
+  } catch (err) {
+    // Undo the create so the user retries a clean form instead of collecting
+    // orphaned drafts every time Gmail is disconnected.
+    await supabase.from('campaigns').delete().eq('id', data.id).eq('user_id', userId)
+    throw err
+  }
 }
 
 /* All of a user's campaigns, newest first, enriched with the (current) template
@@ -218,6 +246,51 @@ function pickExplicitFrequency(frequency) {
   return hasEvery || hasCount ? frequency : null
 }
 
+/* How far behind "now" a requested start time may sit before we reject it.
+   The browser computes the instant from the user's own clock, which can
+   legitimately run a little behind the server's. Anything past this window is
+   a real mistake — a stale form left open overnight, a mistyped year — and
+   must never quietly become "blast the entire list immediately", which is
+   what an unchecked past timestamp would do. */
+export const START_AT_PAST_TOLERANCE_MS = 5 * 60 * 1000
+
+/* Upper bound on how far ahead a campaign can be booked. Guards against a
+   fat-fingered year (2026 → 2062) parking a list in the outbox forever. */
+export const START_AT_MAX_HORIZON_MS = 365 * 24 * 60 * 60 * 1000
+
+/* Resolve the requested start time into the instant the first email goes out.
+   Omitted / empty means "start now", which is the behaviour every campaign had
+   before scheduling existed — that path must stay exactly as it was.
+
+   Returns { startAt, isScheduled } where isScheduled distinguishes a genuine
+   future booking from an immediate start, so callers can tell the user which
+   one they got. Pure and clock-injectable so it can be tested. */
+export function normalizeStartAt(startAt, now = new Date()) {
+  if (startAt == null || startAt === '') {
+    return { startAt: new Date(now.getTime()), isScheduled: false }
+  }
+
+  const date = startAt instanceof Date ? new Date(startAt.getTime()) : new Date(startAt)
+  if (Number.isNaN(date.getTime())) {
+    throw new CampaignError('That send time isn\'t a valid date.', 422)
+  }
+
+  const drift = date.getTime() - now.getTime()
+  if (drift < -START_AT_PAST_TOLERANCE_MS) {
+    throw new CampaignError(
+      'That send time has already passed. Pick a time in the future, or start sending now.',
+      422
+    )
+  }
+  if (drift > START_AT_MAX_HORIZON_MS) {
+    throw new CampaignError('That send time is more than a year away.', 422)
+  }
+
+  // Inside the tolerance window but marginally behind us: clamp to now so the
+  // pacing starts from a clean instant instead of making every send due at once.
+  return { startAt: drift < 0 ? new Date(now.getTime()) : date, isScheduled: drift > 0 }
+}
+
 /* The pacing decision, isolated from all I/O so it can be reasoned about (and
    tested) on its own. Priority: an explicit per-schedule frequency, then the
    one the campaign was created with, then the account's configured gap.
@@ -251,7 +324,15 @@ async function loadAllValidRecipients(listId) {
    This is the moment the whole timeline is decided; the background tick just
    sends whatever is due. Idempotent-guarded: refuses if sends already exist.
 
-   opts: { startAt?, frequency?, dailyLimit? } — all optional. The gap between
+   `startAt` is what makes a campaign SCHEDULED rather than immediate: pass an
+   ISO instant (the browser converts the user's chosen local day + time for us)
+   and the first email goes out then, with the rest paced after it. Omit it and
+   sending begins right away, which is what every campaign did before this
+   existed. Nothing else about the pipeline changes — a future timeline is just
+   a set of campaign_sends rows whose turn hasn't come yet, and the tick already
+   ignores rows that aren't due.
+
+   opts: { startAt?, frequency?, dailyLimit?, replace? } — all optional. The gap between
    sends is resolved in priority order: an explicit `frequency` here → the one
    stored on the campaign at create time → the account's configured
    send_gap_seconds → SEND_DEFAULT_GAP_SECONDS. dailyLimit likewise falls back
@@ -264,11 +345,18 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     throw new CampaignError(`Campaign is already ${campaign.status}.`, 409)
   }
 
+  // Validate the requested time FIRST: everything below this line either costs
+  // a round-trip or mutates state (a reschedule clears the existing outbox), so
+  // a bad timestamp has to be rejected while there's still nothing to undo.
+  // Empty startAt keeps the original behaviour: start pacing from right now.
+  const { startAt, isScheduled } = normalizeStartAt(opts.startAt)
+
   // Mint (or refresh) a Gmail access token now, up front, rather than letting
   // the send-tick cron discover a dead connection later. This also means the
   // token is already cached in google_connections by the time the first send
   // is due, so the tick can reuse it instead of paying for a refresh itself.
   const token = await getValidAccessToken(userId)
+  console.log("🚀 ~ scheduleCampaign ~ token:", token)
   if (token.error === 'network_error') {
     throw new CampaignError('Could not reach Google right now. Try scheduling again in a moment.', 503)
   }
@@ -276,13 +364,18 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     throw new CampaignError('Gmail is not connected. Reconnect your account before scheduling.', 409)
   }
 
-  // Don't double-schedule: a campaign's sends are created exactly once.
-  const { count: existing } = await supabase
-    .from('campaign_sends')
-    .select('id', { count: 'exact', head: true })
-    .eq('campaign_id', campaignId)
-  if (existing && existing > 0) {
-    throw new CampaignError('Campaign is already scheduled.', 409)
+  // Don't double-schedule: a campaign's sends are created exactly once. The one
+  // exception is an explicit reschedule (opts.replace), which has already proven
+  // nothing has gone out and is deliberately rewriting the timeline — it clears
+  // the old outbox further down, once there's a new one ready to take its place.
+  if (!opts.replace) {
+    const { count: existing } = await supabase
+      .from('campaign_sends')
+      .select('id', { count: 'exact', head: true })
+      .eq('campaign_id', campaignId)
+    if (existing && existing > 0) {
+      throw new CampaignError('Campaign is already scheduled.', 409)
+    }
   }
 
   const recipients = await loadAllValidRecipients(campaign.list_id)
@@ -299,8 +392,6 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     userGapSeconds: settings.gapSeconds,
   })
   const dailyLimit = Number(opts.dailyLimit) > 0 ? Number(opts.dailyLimit) : settings.dailyLimit
-  const startAt = opts.startAt ? new Date(opts.startAt) : new Date()
-  if (Number.isNaN(startAt.getTime())) throw new CampaignError('Invalid start time.', 422)
 
   const times = computeSendTimes(recipients.length, { startAt, intervalSeconds, dailyLimit })
 
@@ -323,6 +414,18 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     status: 'scheduled',
   }))
 
+  // Rescheduling swaps the timeline: the old outbox goes only now, with the
+  // replacement rows already built. Everything that could fail — validation, the
+  // Gmail check, loading recipients — has happened by this point, so a booked
+  // campaign is never left with an empty outbox.
+  if (opts.replace) {
+    const { error: clearErr } = await supabase
+      .from('campaign_sends')
+      .delete()
+      .eq('campaign_id', campaignId)
+    if (clearErr) throw clearErr
+  }
+
   // Insert the outbox in chunks; roll back all of it if any chunk fails so we
   // never leave a campaign half-scheduled.
   try {
@@ -334,6 +437,17 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     }
   } catch (err) {
     await supabase.from('campaign_sends').delete().eq('campaign_id', campaignId)
+    // A first-time schedule is still a draft at this point, so unwinding the
+    // outbox is enough. A reschedule, though, is already marked 'scheduled' —
+    // and its previous outbox is gone. Put it back to draft rather than leave
+    // the queue claiming a booking that has nothing behind it.
+    if (opts.replace) {
+      await supabase
+        .from('campaigns')
+        .update({ status: 'draft', scheduled_at: null, updated_at: new Date().toISOString() })
+        .eq('id', campaignId)
+        .eq('user_id', userId)
+    }
     throw err
   }
 
@@ -360,6 +474,7 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     totalScheduled: rows.length,
     intervalSeconds,
     dailyLimit,
+    isScheduled,
     firstSendAt: times[0].toISOString(),
     lastSendAt: times[times.length - 1].toISOString(),
   }
@@ -403,8 +518,11 @@ export async function getSendProgress(userId, campaignId) {
   }
 }
 
-/* Pause a running campaign — the claim query skips non-active campaigns, so
-   already-scheduled sends simply stop being picked up until resumed. */
+/* Pause a campaign — whether it's mid-flight or still waiting for a future
+   send date. claim_due_sends only claims rows whose campaign is 'scheduled' or
+   'sending' (see 20240117000000_scheduled_campaigns.sql), so pausing stops
+   delivery without touching the rows themselves: each keeps its own
+   scheduled_at and becomes eligible again the moment the campaign resumes. */
 export async function pauseCampaign(userId, campaignId) {
   return updateCampaignStatus(userId, campaignId, 'paused')
 }
@@ -416,6 +534,39 @@ export async function resumeCampaign(userId, campaignId) {
     throw new CampaignError('Only a paused campaign can be resumed.', 409)
   }
   return updateCampaignStatus(userId, campaignId, 'scheduled')
+}
+
+/* Move a booked campaign to a different day/time before it has sent anything.
+   The whole per-recipient timeline was computed from the old start instant, so
+   there is nothing to shift — the outbox is discarded and rebuilt from the new
+   one, which also picks up any change to pacing.
+
+   Refused the moment a single email has gone out (or is in flight): from then
+   on the timeline is history, and rewriting it would either mail someone twice
+   or silently drop them. Pause is the tool for that case, not reschedule. */
+export async function rescheduleCampaign(userId, campaignId, opts = {}) {
+  const campaign = await getCampaignForUser(userId, campaignId)
+  if (!campaign) throw new CampaignError('Campaign not found.', 404)
+  if (!['draft', 'scheduled', 'paused'].includes(campaign.status)) {
+    throw new CampaignError(`A ${campaign.status} campaign can't be rescheduled.`, 409)
+  }
+
+  const { count: touched, error: countErr } = await supabase
+    .from('campaign_sends')
+    .select('id', { count: 'exact', head: true })
+    .eq('campaign_id', campaignId)
+    .in('status', ['sent', 'sending', 'failed'])
+  if (countErr) throw countErr
+  if (touched && touched > 0) {
+    throw new CampaignError(
+      'This campaign has already started sending, so its schedule is locked. Pause it instead.',
+      409
+    )
+  }
+
+  // replace:true clears the old outbox; scheduleCampaign rebuilds it and puts
+  // the campaign back into 'scheduled' — which also re-arms a paused one.
+  return scheduleCampaign(userId, campaignId, { ...opts, replace: true })
 }
 
 /* Paginated campaign sends with server-side search, filter, and sort.
