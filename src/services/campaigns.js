@@ -180,6 +180,32 @@ export async function updateCampaignStatus(userId, campaignId, status) {
   const existing = await getCampaignForUser(userId, campaignId)
   if (!existing) throw new CampaignError('Campaign not found.', 404)
 
+  /* Cancelling a campaign has to take its outbox with it.
+
+     This lives HERE rather than only in cancelCampaign() because
+     PATCH /campaigns/:id/status is a public route that accepts 'canceled'
+     directly — and that is the path the queue's stop button actually took.
+     Flipping the campaign row alone left every unsent row in campaign_sends
+     still 'scheduled', so the tick kept claiming them and the emails kept
+     going out from a campaign the user had cancelled.
+
+     Order matters: the sends go first. Cancel them after flipping the campaign
+     and there's a window where the UI says "canceled" while the queue is still
+     live — the exact lie this is fixing. If the outbox can't be cleared we
+     throw and leave the status alone, rather than claim a cancel that didn't
+     happen. */
+  if (status === 'canceled') {
+    const { error: sendsErr } = await supabase
+      .from('campaign_sends')
+      .update({ status: 'canceled', locked_at: null, updated_at: new Date().toISOString() })
+      .eq('campaign_id', campaignId)
+      // Already sent/failed rows are history and stay as they are. 'sending'
+      // rows are released too: one may already be mid-flight at Gmail, but any
+      // that were merely claimed stop here instead of being retried later.
+      .in('status', ['scheduled', 'sending'])
+    if (sendsErr) throw sendsErr
+  }
+
   const patch = { status, updated_at: new Date().toISOString() }
   if (status === 'sending' && !existing.started_at) patch.started_at = new Date().toISOString()
   if (status === 'completed' || status === 'failed' || status === 'canceled') {
@@ -636,16 +662,9 @@ export async function getCampaignStats(userId) {
 }
 
 /* Cancel a campaign and drop any of its sends that haven't gone out yet.
-   Already-sent emails obviously stay sent. */
+   Already-sent emails obviously stay sent. The outbox teardown lives in
+   updateCampaignStatus so that setting the status by any route does the same
+   thing; this stays as the named, intention-revealing entry point. */
 export async function cancelCampaign(userId, campaignId) {
-  const campaign = await getCampaignForUser(userId, campaignId)
-  if (!campaign) throw new CampaignError('Campaign not found.', 404)
-
-  await supabase
-    .from('campaign_sends')
-    .update({ status: 'canceled', updated_at: new Date().toISOString() })
-    .eq('campaign_id', campaignId)
-    .in('status', ['scheduled', 'sending'])
-
   return updateCampaignStatus(userId, campaignId, 'canceled')
 }
