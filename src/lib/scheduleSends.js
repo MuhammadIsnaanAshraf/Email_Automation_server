@@ -42,8 +42,16 @@ function nextUtcMidnight(date) {
 
 /* Compute `count` send times. Returns an array of Date objects, ascending.
    Example: count=50, intervalSeconds=60, startAt=now
-     → [now, now+1m, now+2m, …, now+49m]  (all on the same day if under the cap) */
-export function computeSendTimes(count, { startAt, intervalSeconds = 60, dailyLimit = 400 } = {}) {
+     → [now, now+1m, now+2m, …, now+49m]  (all on the same day if under the cap)
+
+   `floors` (optional): a per-index earliest-allowed time, parallel to the
+   recipient list — e.g. "this recipient's follow-up can't go out before their
+   own initial send + 3 days". When given, the pacing cursor is nudged FORWARD
+   (never back) to meet it before the day-cap check runs, so a later step gets
+   the same pacing/day-cap behaviour as step zero, just not before its floor.
+   Omitted entirely, this is 100% unchanged from the original single-step
+   behaviour — every existing caller keeps working exactly as before. */
+export function computeSendTimes(count, { startAt, intervalSeconds = 60, dailyLimit = 400, floors } = {}) {
   const times = []
   if (count <= 0) return times
 
@@ -57,6 +65,11 @@ export function computeSendTimes(count, { startAt, intervalSeconds = 60, dailyLi
 
   for (let i = 0; i < count; i++) {
     if (i > 0) cursor = new Date(cursor.getTime() + step)
+
+    if (floors && floors[i] != null) {
+      const floor = floors[i] instanceof Date ? floors[i] : new Date(floors[i])
+      if (floor.getTime() > cursor.getTime()) cursor = new Date(floor.getTime())
+    }
 
     // Natural rollover into a new calendar day resets the daily counter.
     const key = utcDayKey(cursor)

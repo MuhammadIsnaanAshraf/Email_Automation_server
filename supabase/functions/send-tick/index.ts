@@ -87,6 +87,28 @@ interface Send {
   bcc: string | null
   extra: Record<string, unknown> | null
   attempts: number
+  sequence_step: number
+}
+
+interface FollowUp {
+  subject: string
+  body: string
+}
+
+interface CampaignContent {
+  subject: string
+  body: string
+  follow_ups: FollowUp[]
+}
+
+// Step 0 is the original email (campaign.subject/body); step N>0 is
+// follow_ups[N-1] — the subset of the template's follow-up sequence the user
+// selected when the campaign was created. Falls back to the original content
+// if a step is somehow out of range, so a send is never left with nothing.
+function contentForStep(campaign: CampaignContent, step: number): { subject: string; body: string } {
+  if (!step) return { subject: campaign.subject, body: campaign.body }
+  const fu = campaign.follow_ups?.[step - 1]
+  return fu ? { subject: fu.subject, body: fu.body } : { subject: campaign.subject, body: campaign.body }
 }
 
 // ── Per-send outcome writers ─────────────────────────────────
@@ -144,7 +166,7 @@ function startOfUtcDayISO(): string {
 async function processUserSend(
   userId: string,
   send: Send,
-  campaigns: Map<string, { subject: string; body: string }>,
+  campaigns: Map<string, CampaignContent>,
   user: { email: string; name: string | null; daily_send_limit: number | null }
 ) {
   const summary = { sent: 0, failed: 0, rescheduled: 0, deferred: 0 }
@@ -229,7 +251,7 @@ async function processUserSend(
   const fromAddress = user.name ? `${user.name} <${user.email}>` : user.email
 
   try {
-    const { subject, body } = renderForRecipient(campaign, send)
+    const { subject, body } = renderForRecipient(contentForStep(campaign, send.sequence_step), send)
     const messageId = await sendEmail(accessToken, {
       from: fromAddress,
       to: send.email,
@@ -311,7 +333,7 @@ Deno.serve(async (req) => {
     console.log("🚀 ~ userIds:", userIds)
 
     const [{ data: campaignRows }, { data: profileRows }, { data: settingsRows }] = await Promise.all([
-      supabase.from('campaigns').select('id, subject, body').in('id', campaignIds),
+      supabase.from('campaigns').select('id, subject, body, follow_ups').in('id', campaignIds),
       supabase.from('profiles').select('id, email, name').in('id', userIds),
       supabase.from('user_settings').select('user_id, daily_send_limit').in('user_id', userIds),
     ])
@@ -326,10 +348,10 @@ Deno.serve(async (req) => {
         s.daily_send_limit,
       ])
     )
-    const campaigns = new Map<string, { subject: string; body: string }>(
-      (campaignRows || []).map((c: { id: string; subject: string; body: string }) => [
+    const campaigns = new Map<string, CampaignContent>(
+      (campaignRows || []).map((c: { id: string; subject: string; body: string; follow_ups: FollowUp[] | null }) => [
         c.id,
-        { subject: c.subject, body: c.body },
+        { subject: c.subject, body: c.body, follow_ups: c.follow_ups || [] },
       ])
     )
     const users = new Map<string, { email: string; name: string | null; daily_send_limit: number }>()

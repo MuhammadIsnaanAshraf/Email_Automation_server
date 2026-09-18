@@ -34,7 +34,7 @@ export class CampaignError extends Error {
    just created and rethrows: the caller either gets a scheduled campaign or gets
    an error, never a half-made one. */
 export async function createCampaign(userId, input = {}) {
-  const { templateId = null, listId, scheduledAt = null, frequency = {} } = input
+  const { templateId = null, listId, scheduledAt = null, frequency = {}, followUpCount = 0 } = input
   console.log("🚀 ~ createCampaign ~ frequency:", frequency)
   console.log("🚀 ~ createCampaign ~ scheduledAt:", scheduledAt)
   console.log("🚀 ~ createCampaign ~ listId:", listId)
@@ -69,6 +69,20 @@ export async function createCampaign(userId, input = {}) {
   if (!subject) throw new CampaignError('A subject line is required.', 422)
   if (!body.trim()) throw new CampaignError('A message body is required.', 422)
 
+  // Follow-ups only ever come from the template (there's no equivalent for an
+  // ad-hoc subject/body override) — snapshot exactly as many as the caller
+  // asked for, clamped to what the template actually has, same reasoning as
+  // the subject/body snapshot above: later edits to the template must not
+  // reach back into an already-created campaign.
+  const availableFollowUps = Array.isArray(template?.follow_ups) ? template.follow_ups : []
+  const wantedFollowUps = Math.max(0, Math.min(Math.round(Number(followUpCount)) || 0, availableFollowUps.length))
+  const followUps = availableFollowUps.slice(0, wantedFollowUps).map((fu) => ({
+    id: fu.id,
+    subject: fu.subject,
+    body: fu.body,
+    delayDays: fu.delayDays,
+  }))
+
   const name =
     String(input.name || '').trim() ||
     `${template?.name || 'Campaign'} → ${list.name}`
@@ -87,6 +101,7 @@ export async function createCampaign(userId, input = {}) {
       subject,
       body,
       variables: extractVariables(subject, body),
+      follow_ups: followUps,
       total_recipients: list.valid_rows,
       status,
       scheduled_at: null,
@@ -421,7 +436,10 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
 
   const times = computeSendTimes(recipients.length, { startAt, intervalSeconds, dailyLimit })
 
-  const rows = recipients.map((r, i) => ({
+  // Snapshot fields shared by every step of a given recipient — computed once
+  // and reused so the follow-up rows below aren't a copy-pasted duplicate of
+  // this mapping.
+  const snapshotFor = (r) => ({
     campaign_id: campaignId,
     user_id: userId,
     recipient_id: r.id,
@@ -436,9 +454,41 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     // column is `extra`. Read the former (falling back to `extra`) so {{token}}
     // personalization from unmapped columns actually survives into the send.
     extra: r.extra_data || r.extra || {},
+  })
+
+  const rows = recipients.map((r, i) => ({
+    ...snapshotFor(r),
     scheduled_at: times[i].toISOString(),
     status: 'scheduled',
+    sequence_step: 0,
   }))
+
+  // Follow-ups: each step's floor is the recipient's OWN previous-step time
+  // plus that step's day-gap — so the sequence is paced individually per
+  // recipient, not just offset from a single global start. Cumulative,
+  // because delayDays on a follow-up means "N days after the previous email
+  // in the sequence", not "N days after the very first one".
+  const followUps = Array.isArray(campaign.follow_ups) ? campaign.follow_ups : []
+  let cumulativeMs = 0
+  for (let step = 0; step < followUps.length; step++) {
+    const delayDays = Number(followUps[step]?.delayDays) || 0
+    cumulativeMs += delayDays * 24 * 60 * 60 * 1000
+    const floors = times.map((t) => new Date(t.getTime() + cumulativeMs))
+    const stepTimes = computeSendTimes(recipients.length, {
+      startAt: floors[0],
+      intervalSeconds,
+      dailyLimit,
+      floors,
+    })
+    recipients.forEach((r, i) => {
+      rows.push({
+        ...snapshotFor(r),
+        scheduled_at: stepTimes[i].toISOString(),
+        status: 'scheduled',
+        sequence_step: step + 1,
+      })
+    })
+  }
 
   // Rescheduling swaps the timeline: the old outbox goes only now, with the
   // replacement rows already built. Everything that could fail — validation, the
@@ -495,6 +545,10 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     .single()
   if (updErr) throw updErr
 
+  // Last send across every step (a follow-up can easily land after the
+  // initial batch's own last row), not just step zero's.
+  const lastSendMs = rows.reduce((max, row) => Math.max(max, new Date(row.scheduled_at).getTime()), 0)
+
   return {
     campaign: updated,
     totalScheduled: rows.length,
@@ -502,7 +556,7 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     dailyLimit,
     isScheduled,
     firstSendAt: times[0].toISOString(),
-    lastSendAt: times[times.length - 1].toISOString(),
+    lastSendAt: new Date(lastSendMs).toISOString(),
   }
 }
 
