@@ -86,6 +86,20 @@ async function insertDraftList({ userId, listName, filename, recipients, headers
     throw err
   }
 
+  /* Flag any address on this sheet that this account has already burned
+     through. The sheet is where the user looks, so an address that bounced
+     twice during last month's campaign should show as bounced the moment it is
+     re-uploaded — not stay clean until its first send is silently skipped.
+
+     Best-effort: a failure here leaves the list intact and unmarked rather than
+     throwing away a good import. The send queue enforces suppression either
+     way, so the consequence is a stale badge, not a wrong email. */
+  const { error: syncErr } = await supabase.rpc('sync_list_suppressions', {
+    p_user_id: userId,
+    p_list_id: list.id,
+  })
+  if (syncErr) console.error('[lists] sync_list_suppressions failed:', syncErr)
+
   return list.id
 }
 
@@ -196,6 +210,7 @@ const SORTABLE_COLUMNS = {
   company: 'company',
   status: 'is_valid',
   is_valid: 'is_valid',
+  delivery_state: 'delivery_state',
 }
 
 /* Escape a user search term for use inside a PostgREST `.or(...)` filter.
@@ -233,6 +248,11 @@ export async function getRecipients(
 
   if (filter === 'valid') query = query.eq('is_valid', true)
   else if (filter === 'invalid') query = query.eq('is_valid', false)
+  // Suppression is orthogonal to validation: a suppressed address is perfectly
+  // well-formed, it just can't be mailed. 'mailable' is what a campaign will
+  // actually send to — valid AND not suppressed.
+  else if (filter === 'suppressed') query = query.not('suppressed_at', 'is', null)
+  else if (filter === 'mailable') query = query.eq('is_valid', true).is('suppressed_at', null)
 
   const term = sanitizeSearch(search)
   if (term) {

@@ -144,17 +144,19 @@ router.get('/:id/usage', async (req, res, next) => {
 })
 
 /* ── Get one list + its recipients (paginated / filterable) ───
-   GET /lists/:id?filter=all|valid|invalid&page=1&pageSize=50 */
+   GET /lists/:id?filter=all|valid|invalid|suppressed|mailable&page=1&pageSize=50 */
 router.get('/:id', async (req, res, next) => {
   try {
     const list = await getListForUser(req.user.id, req.params.id)
     if (!list) return res.status(404).json({ error: 'list_not_found' })
 
-    const filter = ['all', 'valid', 'invalid'].includes(req.query.filter) ? req.query.filter : 'all'
+    const filter = ['all', 'valid', 'invalid', 'suppressed', 'mailable'].includes(req.query.filter)
+      ? req.query.filter
+      : 'all'
     const page = Math.max(1, parseInt(req.query.page, 10) || 1)
     const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
     const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
-    const sort = ['row_number', 'email', 'name', 'website', 'company', 'status', 'is_valid'].includes(req.query.sort)
+    const sort = ['row_number', 'email', 'name', 'website', 'company', 'status', 'is_valid', 'delivery_state'].includes(req.query.sort)
       ? req.query.sort : 'row_number'
     const dir = req.query.dir === 'desc' ? 'desc' : 'asc'
 

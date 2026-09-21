@@ -22,6 +22,7 @@ import campaignRoutes from './routes/campaigns.js'
 import adminRoutes from './routes/admin.js'
 import subscriptionRoutes from './routes/subscriptions.js'
 import settingsRoutes from './routes/settings.js'
+import suppressionRoutes from './routes/suppressions.js'
 
 const app = express()
 
@@ -55,6 +56,7 @@ app.use('/campaigns', campaignRoutes)
 app.use('/admin', adminRoutes)
 app.use('/subscriptions', subscriptionRoutes)
 app.use('/settings', settingsRoutes)
+app.use('/suppressions', suppressionRoutes)
 
 app.use((err, _req, res, _next) => {
   console.error('[error]', err)

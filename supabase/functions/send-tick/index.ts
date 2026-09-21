@@ -24,7 +24,14 @@
 import { createClient } from 'npm:@supabase/supabase-js@2'
 import { decryptToken, encryptToken } from './crypto.ts'
 import { renderForRecipient } from './render.ts'
-import { refreshAccessToken, sendEmail, SendError, ConnectionError } from './gmail.ts'
+import {
+  refreshAccessToken,
+  sendEmail,
+  fetchMessageId,
+  extractEnhancedStatus,
+  SendError,
+  ConnectionError,
+} from './gmail.ts'
 
 // How much longer a cached access token must still have left before we'll
 // reuse it without hitting Google. Access tokens mint ~1hr; campaigns are
@@ -87,16 +94,30 @@ interface Send {
   bcc: string | null
   extra: Record<string, unknown> | null
   attempts: number
+  normalized_email: string
 }
 
 // ── Per-send outcome writers ─────────────────────────────────
-async function markSent(id: string, messageId: string) {
+/* A delivered-to-Gmail send. `threadId` and `rfc822MessageId` are what make a
+   bounce notice traceable back to THIS row weeks later — see bounce-scan.
+   delivery_state starts at 'pending': Gmail accepting the message says nothing
+   about whether the receiving server will, and until the grace window passes
+   without a failure notice we genuinely do not know. */
+async function markSent(
+  id: string,
+  messageId: string,
+  threadId: string | null,
+  rfc822MessageId: string | null
+) {
   await supabase
     .from('campaign_sends')
     .update({
       status: 'sent',
       sent_at: new Date().toISOString(),
       gmail_message_id: messageId,
+      gmail_thread_id: threadId,
+      rfc822_message_id: rfc822MessageId,
+      delivery_state: 'pending',
       error: null,
       locked_at: null,
       updated_at: new Date().toISOString(),
@@ -108,6 +129,22 @@ async function markFailed(id: string, error: string) {
   await supabase
     .from('campaign_sends')
     .update({ status: 'failed', error, locked_at: null, updated_at: new Date().toISOString() })
+    .eq('id', id)
+}
+
+/* Take a send out of the queue without attempting it: the address is on the
+   account's suppression list. Terminal, and deliberately NOT 'failed' — we
+   never tried, so it isn't a delivery failure and must not inflate the
+   campaign's failed count. */
+async function markSkipped(id: string, reason: string) {
+  await supabase
+    .from('campaign_sends')
+    .update({
+      status: 'skipped',
+      error: `suppressed_${reason}`,
+      locked_at: null,
+      updated_at: new Date().toISOString(),
+    })
     .eq('id', id)
 }
 
@@ -147,7 +184,34 @@ async function processUserSend(
   campaigns: Map<string, { subject: string; body: string }>,
   user: { email: string; name: string | null; daily_send_limit: number | null }
 ) {
-  const summary = { sent: 0, failed: 0, rescheduled: 0, deferred: 0 }
+  const summary = { sent: 0, failed: 0, rescheduled: 0, deferred: 0, skipped: 0 }
+
+  // 0) Is this address on the do-not-send list?
+  //
+  // claim_due_sends already clears suppressed rows out of the queue before
+  // handing anything over, so this is belt-and-braces — but the gap it covers
+  // is real: a bounce scan running concurrently can suppress an address in the
+  // seconds between this row being claimed and being sent. Suppression is
+  // permanent and the whole point is that it is never violated, so it costs one
+  // indexed lookup to be certain.
+  const { data: suppression } = await supabase
+    .from('email_suppressions')
+    .select('reason')
+    .eq('user_id', userId)
+    .eq('normalized_email', send.normalized_email)
+    .eq('status', 'suppressed')
+    .maybeSingle()
+
+  if (suppression) {
+    console.log('[send-tick] skipping suppressed address:', {
+      userId,
+      sendId: send.id,
+      reason: suppression.reason,
+    })
+    await markSkipped(send.id, suppression.reason || 'suppressed')
+    summary.skipped++
+    return summary
+  }
 
   // 1) Get a valid access token for this account — reuse the cached one from
   // google_connections (minted at campaign-schedule time, or by an earlier
@@ -182,6 +246,11 @@ async function processUserSend(
           token_expiry: new Date(refreshed.expiresAt).toISOString(),
           status: 'connected',
           last_error: null,
+          // Google's refresh response is the only place we hear which scopes
+          // were really granted, so correct the optimistic list written at
+          // sign-in. Omitted when Google didn't say, so a quiet response never
+          // wipes what we already know.
+          ...(refreshed.scopes ? { scopes: refreshed.scopes } : {}),
           updated_at: new Date().toISOString(),
         })
         .eq('user_id', userId)
@@ -230,7 +299,7 @@ async function processUserSend(
 
   try {
     const { subject, body } = renderForRecipient(campaign, send)
-    const messageId = await sendEmail(accessToken, {
+    const sent = await sendEmail(accessToken, {
       from: fromAddress,
       to: send.email,
       cc: send.cc,
@@ -238,7 +307,15 @@ async function processUserSend(
       subject,
       html: body,
     })
-    await markSent(send.id, messageId)
+
+    // Read back the Message-ID Gmail stamped on it. This is what lets a bounce
+    // arriving hours later be matched to THIS send exactly, rather than to
+    // "the most recent mail we sent that address". Best-effort: the account may
+    // not have granted a read scope yet, and a message that is already gone
+    // must not be marked failed because a follow-up lookup was refused.
+    const rfc822MessageId = sent.id ? await fetchMessageId(accessToken, sent.id) : null
+
+    await markSent(send.id, sent.id, sent.threadId || null, rfc822MessageId)
     summary.sent++
   } catch (err) {
     console.error('[send-tick] send failed:', { userId, sendId: send.id, error: err })
@@ -252,7 +329,46 @@ async function processUserSend(
         .update({ access_token: null, token_expiry: null })
         .eq('user_id', userId)
     }
-    // Any failure here — retryable SendError, terminal SendError, or an
+    // Gmail sometimes refuses a send synchronously and quotes the receiving
+    // server's own SMTP reply back at us, enhanced status code included. That
+    // is the same evidence a bounce notice carries — the recipient's mail
+    // system saying no — just delivered immediately instead of by return post,
+    // so it counts exactly the same.
+    //
+    // extractEnhancedStatus is deliberately narrow: it returns a code only for
+    // 5.1.x / 5.2.x, the families that describe the recipient's mailbox and
+    // nothing else. Gmail's own failures (daily quota, rate limits, bad auth)
+    // travel this same path carrying valid-looking codes, and charging one of
+    // those to an address would blacklist a working recipient for our mistake.
+    if (err instanceof SendError) {
+      const status = extractEnhancedStatus(err.body)
+      if (status) {
+        const { error: recordErr } = await supabase.rpc('record_delivery_failure', {
+          p_user_id: userId,
+          // The send row's own id is a stable dedupe key here: one synchronous
+          // rejection per attempt, and a retry of the same row must not be
+          // charged twice for the same refusal.
+          p_source_message_id: `send:${send.id}`,
+          p_recipient_email: send.email,
+          p_status_code: status,
+          p_diagnostic: (err.body || err.message).slice(0, 2000),
+          p_action: 'failed',
+          p_send_id: send.id,
+          p_campaign_id: send.campaign_id,
+          p_match_method: 'send_response',
+          p_reported_at: new Date().toISOString(),
+        })
+        if (recordErr) console.error('[send-tick] record_delivery_failure failed:', recordErr)
+
+        // A permanent refusal is not worth five retries — the receiving server
+        // has already given its final answer.
+        await markFailed(send.id, `${status}: ${err.message.slice(0, 300)}`)
+        summary.failed++
+        return summary
+      }
+    }
+
+    // Any other failure — retryable SendError, terminal SendError, or an
     // unexpected exception (rendering bug, network hiccup, etc.) — goes back
     // into the queue with backoff rather than being marked failed outright on
     // its first occurrence. handleRetryable's own MAX_ATTEMPTS cap is what
@@ -358,6 +474,7 @@ Deno.serve(async (req) => {
             failed: 1,
             rescheduled: 0,
             deferred: 0,
+            skipped: 0,
           }))
         }
         return processUserSend(userId, send, campaigns, user)
@@ -369,7 +486,7 @@ Deno.serve(async (req) => {
     const perUser = results.map((r) => {
       if (r.status === 'rejected') {
         console.error('[send-tick] per-user send failed:', r.reason)
-        return { sent: 0, failed: 0, rescheduled: 0, deferred: 0 }
+        return { sent: 0, failed: 0, rescheduled: 0, deferred: 0, skipped: 0 }
       }
       return r.value
     })
@@ -383,8 +500,9 @@ Deno.serve(async (req) => {
         failed: acc.failed + s.failed,
         rescheduled: acc.rescheduled + s.rescheduled,
         deferred: acc.deferred + s.deferred,
+        skipped: acc.skipped + s.skipped,
       }),
-      { sent: 0, failed: 0, rescheduled: 0, deferred: 0 }
+      { sent: 0, failed: 0, rescheduled: 0, deferred: 0, skipped: 0 }
     )
 
     return Response.json({ ok: true, claimed: sends.length, users: byUser.size, ...totals })

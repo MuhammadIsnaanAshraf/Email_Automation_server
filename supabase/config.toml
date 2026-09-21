@@ -5,3 +5,6 @@ project_id = "your-project-id"
 
 [functions.subscription-reminders]
   verify_jwt = false
+
+[functions.bounce-scan]
+  verify_jwt = false

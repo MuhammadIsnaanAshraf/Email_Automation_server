@@ -1,6 +1,7 @@
 import { supabase } from '../lib/supabase.js'
 import { encrypt, decrypt } from '../lib/crypto.js'
 import { refreshAccessToken } from '../lib/google.js'
+import { GMAIL_SEND_SCOPE, GMAIL_READ_SCOPE } from '../config/env.js'
 
 /* The Gmail-sending grant for a user. Tokens are encrypted at rest; the rest of
    the app reads `status` to know whether the connection is healthy. */
@@ -46,19 +47,39 @@ export async function getConnection(userId) {
 }
 
 /* Public-facing view of the connection — safe to send to the frontend. Never
-   includes the tokens themselves. This is what powers the "reconnect" prompt. */
+   includes the tokens themselves. This is what powers the "reconnect" prompt.
+
+   The two capabilities are reported separately on purpose. gmail.readonly was
+   added after launch, so an account connected before then can still send
+   perfectly well — it just cannot have its bounces detected, because that means
+   reading the delivery-failure notices Gmail files in its own mailbox. Blocking
+   such an account from sending would be a worse outcome than sending without
+   bounce tracking, so `needsReconnect` stays tied to sending and
+   `bounceTrackingAvailable` carries the softer prompt. */
 export function toPublicStatus(connection) {
-  console.log("🚀 ~ toPublicStatus ~ connection:", connection)
   if (!connection) {
-    return { status: 'disconnected', canSendEmail: false, needsReconnect: true }
+    return {
+      status: 'disconnected',
+      canSendEmail: false,
+      canDetectBounces: false,
+      bounceTrackingAvailable: false,
+      needsReconnect: true,
+      needsReconnectForBounces: true,
+    }
   }
-  const canSendEmail =
-    connection.status === 'connected' &&
-    connection.scopes?.includes('https://www.googleapis.com/auth/gmail.send')
+  const connected = connection.status === 'connected'
+  const canSendEmail = connected && connection.scopes?.includes(GMAIL_SEND_SCOPE)
+  const canDetectBounces = connected && connection.scopes?.includes(GMAIL_READ_SCOPE)
+
   return {
     status: connection.status,
     canSendEmail,
-    needsReconnect: connection.status !== 'connected' || !canSendEmail,
+    canDetectBounces,
+    bounceTrackingAvailable: canDetectBounces,
+    needsReconnect: !connected || !canSendEmail,
+    // Sending still works; only bounce detection is dark. The UI shows this as
+    // a notice rather than a blocker.
+    needsReconnectForBounces: canSendEmail && !canDetectBounces,
     scopes: connection.scopes || [],
     connectedAt: connection.connected_at,
     lastError: connection.last_error || null,

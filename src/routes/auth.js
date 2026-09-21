@@ -92,7 +92,12 @@ router.post('/reconnect', requireAuth, async (req, res) => {
       provider: 'google',
       options: {
         redirectTo: `${req.headers.origin || 'http://localhost:5173'}/auth/callback`,
-        scopes: 'openid email profile https://www.googleapis.com/auth/gmail.send',
+        scopes:
+          'openid email profile ' +
+          'https://www.googleapis.com/auth/gmail.send ' +
+          // Reading the account's own delivery-failure notices is the only
+          // way to know a message actually bounced rather than assume it.
+          'https://www.googleapis.com/auth/gmail.readonly',
         queryParams: {
           access_type: 'offline',
           prompt: 'consent',

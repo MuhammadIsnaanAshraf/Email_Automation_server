@@ -5,6 +5,7 @@ import { computeSendTimes, frequencyToIntervalSeconds } from '../lib/scheduleSen
 import { getListForUser, getRecipients } from './lists.js'
 import { getTemplateForUser } from './templates.js'
 import { getValidAccessToken } from './connections.js'
+import { partitionSuppressed } from './suppressions.js'
 
 export class CampaignError extends Error {
   constructor(message, status = 400) {
@@ -404,9 +405,30 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     }
   }
 
-  const recipients = await loadAllValidRecipients(campaign.list_id)
-  if (recipients.length === 0) {
+  const allRecipients = await loadAllValidRecipients(campaign.list_id)
+  if (allRecipients.length === 0) {
     throw new CampaignError('That list has no valid recipients to send to.', 422)
+  }
+
+  /* Drop addresses on the account's do-not-send list before the timeline is
+     computed. Booking them and skipping them later would work — claim_due_sends
+     removes suppressed rows from the queue regardless — but it would also hand
+     every one of them a slot in the pacing schedule, so a list that is half
+     bounced addresses would take twice as long to deliver to the half that is
+     still good. Filtering here keeps the schedule honest.
+
+     This is a convenience, not the safeguard: a list uploaded after an address
+     was suppressed, or an address suppressed tomorrow by a bounce that hasn't
+     arrived yet, is still caught by the queue. */
+  const { mailable: recipients, suppressed } = await partitionSuppressed(userId, allRecipients)
+  if (recipients.length === 0) {
+    throw new CampaignError(
+      suppressed.length
+        ? `Every address on this list has bounced or been blocked before, so there is nobody left to email. ` +
+          `Check the suppressed list if you think that's wrong.`
+        : 'That list has no valid recipients to send to.',
+      422
+    )
   }
 
   // Gap resolution: explicit request → campaign's own → account's configured
@@ -503,6 +525,14 @@ export async function scheduleCampaign(userId, campaignId, opts = {}) {
     isScheduled,
     firstSendAt: times[0].toISOString(),
     lastSendAt: times[times.length - 1].toISOString(),
+    // Addresses left out because they're suppressed. Surfaced so the UI can say
+    // "scheduled 480 of 500 — 20 previously bounced" instead of quietly
+    // shrinking the campaign.
+    suppressedCount: suppressed.length,
+    suppressedSample: suppressed.slice(0, 20).map((r) => ({
+      email: r.email,
+      reason: r.suppressionReason,
+    })),
   }
 }
 
@@ -511,7 +541,10 @@ export async function getSendProgress(userId, campaignId) {
   const campaign = await getCampaignForUser(userId, campaignId)
   if (!campaign) throw new CampaignError('Campaign not found.', 404)
 
-  const statuses = ['scheduled', 'sending', 'sent', 'failed', 'canceled']
+  // 'skipped' = suppressed before its turn came up. Counted here so the totals
+  // add up to the campaign's recipient count; excluded from `remaining` below
+  // because it is terminal, not pending.
+  const statuses = ['scheduled', 'sending', 'sent', 'failed', 'canceled', 'skipped']
   const counts = {}
   await Promise.all(
     statuses.map(async (status) => {

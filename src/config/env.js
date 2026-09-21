@@ -57,13 +57,28 @@ export function clampGapSeconds(value, fallback = 120) {
   return Math.min(Math.floor(n), 86400)
 }
 
-/* The single OAuth scope set we request. Login (identity) + Gmail send are
-   granted together in one consent screen, exactly as the product requires. */
+/* The single OAuth scope set we request. Login (identity), Gmail send and
+   Gmail read are granted together in one consent screen.
+
+   gmail.readonly is what makes bounce and block detection possible at all.
+   Gmail's send API returns 200 for practically every message — it accepts the
+   mail and only learns it was refused when the receiving server says so, and
+   that refusal arrives as a delivery-status notice in the SENDER's own
+   mailbox. Without read access there is no way to know a message bounced, only
+   ways to guess, and a wrong guess suppresses a real customer permanently.
+
+   Accounts connected before this scope was added keep working for sending; the
+   bounce scanner records 'missing_scope' against them and the app prompts a
+   reconnect. See GMAIL_READ_SCOPE below. */
+export const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send'
+export const GMAIL_READ_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
+
 export const GOOGLE_SCOPES = [
   'openid',
   'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/userinfo.profile',
-  'https://www.googleapis.com/auth/gmail.send',
+  GMAIL_SEND_SCOPE,
+  GMAIL_READ_SCOPE,
 ]
 
 export const SESSION_COOKIE = 'fs_session'
