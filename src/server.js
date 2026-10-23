@@ -23,6 +23,8 @@ import adminRoutes from './routes/admin.js'
 import subscriptionRoutes from './routes/subscriptions.js'
 import settingsRoutes from './routes/settings.js'
 import suppressionRoutes from './routes/suppressions.js'
+import leadRoutes from './routes/leads.js'
+import { resumeRunningSearches } from './services/leads.js'
 
 const app = express()
 
@@ -57,6 +59,7 @@ app.use('/admin', adminRoutes)
 app.use('/subscriptions', subscriptionRoutes)
 app.use('/settings', settingsRoutes)
 app.use('/suppressions', suppressionRoutes)
+app.use('/leads', leadRoutes)
 
 app.use((err, _req, res, _next) => {
   console.error('[error]', err)
@@ -65,4 +68,7 @@ app.use((err, _req, res, _next) => {
 
 app.listen(env.port, () => {
   console.log(`Zenviqo backend listening on ${env.backendUrl} (port ${env.port})`)
+  // Lead searches run in this process; pick up any that were mid-flight when
+  // it last stopped.
+  resumeRunningSearches()
 })

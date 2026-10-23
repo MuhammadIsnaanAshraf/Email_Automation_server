@@ -45,6 +45,18 @@ export const env = {
     // existing behaviour is unchanged until someone configures otherwise.
     defaultGapSeconds: clampGapSeconds(process.env.SEND_DEFAULT_GAP_SECONDS, 120),
   },
+
+  leads: {
+    // Provider API tokens, tried in order. When one hits its monthly limit the
+    // next is used for the same search. Optional: with none set, the lead
+    // finder reports itself unavailable and everything else runs normally.
+    apifyTokens: (process.env.APIFY_TOKENS || '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean),
+    actorId: process.env.APIFY_LEADS_ACTOR_ID || 'T1XDXWc1L92AfIJtd',
+    maxPerSearch: Math.max(1, Math.min(Number(process.env.LEADS_MAX_PER_SEARCH) || 500, 5000)),
+  },
 }
 
 /* Keep any gap (env or per-user) inside the same sane window the DB check

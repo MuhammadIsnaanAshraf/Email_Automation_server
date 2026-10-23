@@ -19,11 +19,16 @@ export class CampaignError extends Error {
    uploaded list. The template content is SNAPSHOTTED onto the campaign so later
    edits/deletes to the template don't mutate an already-created campaign.
 
-   Input: { name?, templateId?, subject?, body?, listId, scheduledAt?, frequency? }
+   Input: { name?, templateId?, subject?, body?, listId, scheduledAt?, frequency?,
+            trackOpens?, trackClicks? }
    - If templateId is given, its subject/body are used (unless subject/body are
      also explicitly provided, which override — e.g. the user tweaked a loaded
      template before scheduling).
    - The list must belong to the user and have at least one valid recipient.
+   - `trackOpens` / `trackClicks` switch on the open pixel and link redirects
+     for this campaign's sends. Both default to ON, like every major platform;
+     pass false to send the body untouched (replies are tracked either way —
+     they need no instrumentation).
    - `scheduledAt` (ISO instant) books the campaign in the same step: the send
      timeline is materialized immediately, exactly as if the user had created a
      draft and then pressed play with that time. Omit it for a plain draft.
@@ -92,6 +97,8 @@ export async function createCampaign(userId, input = {}) {
       status,
       scheduled_at: null,
       frequency: frequency && typeof frequency === 'object' ? frequency : {},
+      track_opens: input.trackOpens !== false,
+      track_clicks: input.trackClicks !== false,
     })
     .select()
     .single()
@@ -630,11 +637,16 @@ export async function rescheduleCampaign(userId, campaignId, opts = {}) {
 
 /* Paginated campaign sends with server-side search, filter, and sort.
    Used by the campaign detail page to show per-recipient send status. */
-export async function getCampaignSends(userId, campaignId, { page = 1, pageSize = 50, filter = 'all', search = '', sort = 'scheduled_at', dir = 'asc' } = {}) {
+export const ENGAGEMENT_FILTERS = new Set(['all', 'opened', 'clicked', 'replied', 'unopened'])
+
+export async function getCampaignSends(userId, campaignId, { page = 1, pageSize = 50, filter = 'all', engagement = 'all', search = '', sort = 'scheduled_at', dir = 'asc' } = {}) {
   const campaign = await getCampaignForUser(userId, campaignId)
   if (!campaign) throw new CampaignError('Campaign not found.', 404)
 
-  const ALLOWED_SORTS = new Set(['email', 'name', 'status', 'scheduled_at', 'sent_at', 'attempts'])
+  const ALLOWED_SORTS = new Set([
+    'email', 'name', 'status', 'scheduled_at', 'sent_at', 'attempts',
+    'open_count', 'click_count', 'first_opened_at', 'replied_at',
+  ])
   const sortCol = ALLOWED_SORTS.has(sort) ? sort : 'scheduled_at'
   const sortDir = dir === 'desc' ? { ascending: false } : { ascending: true }
 
@@ -646,6 +658,11 @@ export async function getCampaignSends(userId, campaignId, { page = 1, pageSize 
   if (filter !== 'all') {
     query = query.eq('status', filter)
   }
+  // Engagement is independent of the status filter, so the two combine.
+  if (engagement === 'opened') query = query.not('first_opened_at', 'is', null)
+  else if (engagement === 'clicked') query = query.not('first_clicked_at', 'is', null)
+  else if (engagement === 'replied') query = query.not('replied_at', 'is', null)
+  else if (engagement === 'unopened') query = query.eq('status', 'sent').is('first_opened_at', null)
   if (search) {
     query = query.or(`email.ilike.%${search}%,name.ilike.%${search}%`)
   }
@@ -654,18 +671,19 @@ export async function getCampaignSends(userId, campaignId, { page = 1, pageSize 
   const to = from + pageSize - 1
 
   const { data, error, count } = await query
-    .order(sortCol, sortDir)
+    // Engagement columns are mostly null; keep the engaged rows on top either way.
+    .order(sortCol, { ...sortDir, nullsFirst: false })
     .range(from, to)
 
   if (error) throw error
-  return { sends: data || [], total: count || 0, page, pageSize, filter, search, sort, dir }
+  return { sends: data || [], total: count || 0, page, pageSize, filter, engagement, search, sort, dir }
 }
 
 /* Aggregate stats across all of a user's campaigns. */
 export async function getCampaignStats(userId) {
   const { data, error } = await supabase
     .from('campaigns')
-    .select('status, sent_count, failed_count, total_recipients')
+    .select('*')
     .eq('user_id', userId)
 
   if (error) throw error
@@ -673,11 +691,17 @@ export async function getCampaignStats(userId) {
   let totalSent = 0
   let totalFailed = 0
   let totalPending = 0
+  let totalOpened = 0
+  let totalClicked = 0
+  let totalReplied = 0
   const statusCounts = {}
 
   for (const c of data || []) {
     totalSent += c.sent_count || 0
     totalFailed += c.failed_count || 0
+    totalOpened += c.opened_count || 0
+    totalClicked += c.clicked_count || 0
+    totalReplied += c.replied_count || 0
     if (['scheduled', 'sending', 'paused'].includes(c.status)) {
       totalPending += Math.max(0, (c.total_recipients || 0) - (c.sent_count || 0) - (c.failed_count || 0))
     }
@@ -689,6 +713,9 @@ export async function getCampaignStats(userId) {
     totalSent,
     totalFailed,
     totalPending,
+    totalOpened,
+    totalClicked,
+    totalReplied,
     totalRecipients: data?.reduce((s, c) => s + (c.total_recipients || 0), 0) || 0,
     statusCounts,
   }
@@ -700,4 +727,107 @@ export async function getCampaignStats(userId) {
    thing; this stays as the named, intention-revealing entry point. */
 export async function cancelCampaign(userId, campaignId) {
   return updateCampaignStatus(userId, campaignId, 'canceled')
+}
+
+// ─────────────────────────────────────────────────────────────
+// Engagement: opens, clicks, replies
+// ─────────────────────────────────────────────────────────────
+
+const pct = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 10 : 0)
+
+async function countSends(campaignId, apply) {
+  const { count, error } = await apply(
+    supabase.from('campaign_sends').select('id', { count: 'exact', head: true }).eq('campaign_id', campaignId)
+  )
+  if (error) throw error
+  return count || 0
+}
+
+/* The campaign's engagement report. Rates use DELIVERED sends as the
+   denominator (sent minus bounced/blocked) — a message that never arrived
+   can't be opened, and counting it would understate every rate.
+
+   Opens and clicks are unique recipients from counted hits only. The hits the
+   filters set aside (scanners, Apple Mail Privacy Protection, prefetches,
+   autoresponders) are reported separately so the numbers can be trusted
+   without hiding anything. */
+export async function getCampaignEngagement(userId, campaignId) {
+  const campaign = await getCampaignForUser(userId, campaignId)
+  if (!campaign) throw new CampaignError('Campaign not found.', 404)
+
+  const [sent, failedDelivery, autoReplied, totals, links, filtered] = await Promise.all([
+    countSends(campaignId, (q) => q.eq('status', 'sent')),
+    countSends(campaignId, (q) => q.eq('status', 'sent').in('delivery_state', ['bounced', 'blocked'])),
+    countSends(campaignId, (q) => q.not('auto_replied_at', 'is', null)),
+    supabase.rpc('campaign_engagement_totals', { p_user_id: userId, p_campaign_id: campaignId }),
+    supabase.rpc('campaign_link_stats', { p_user_id: userId, p_campaign_id: campaignId, p_limit: 25 }),
+    supabase.rpc('campaign_filtered_engagement', { p_user_id: userId, p_campaign_id: campaignId }),
+  ])
+  if (totals.error) throw totals.error
+  if (links.error) throw links.error
+  if (filtered.error) throw filtered.error
+  const hitTotals = totals.data?.[0] || {}
+
+  const delivered = Math.max(0, sent - failedDelivery)
+  const opened = campaign.opened_count || 0
+  const clicked = campaign.clicked_count || 0
+  const replied = campaign.replied_count || 0
+
+  return {
+    tracking: { opens: !!campaign.track_opens, clicks: !!campaign.track_clicks, replies: true },
+    sent,
+    delivered,
+    bounced: failedDelivery,
+    opened,
+    clicked,
+    replied,
+    autoReplied,
+    totalOpens: Number(hitTotals.total_opens || 0),
+    totalClicks: Number(hitTotals.total_clicks || 0),
+    rates: {
+      open: pct(opened, delivered),
+      click: pct(clicked, delivered),
+      reply: pct(replied, delivered),
+      // Of the people who opened, how many clicked — the content's pull,
+      // independent of the subject line's.
+      clickToOpen: pct(clicked, opened),
+    },
+    links: (links.data || []).map((l) => ({
+      url: l.url,
+      clicks: Number(l.clicks),
+      uniqueClicks: Number(l.unique_clicks),
+    })),
+    filtered: (filtered.data || []).map((f) => ({
+      kind: f.kind,
+      reason: f.filter_reason,
+      hits: Number(f.hits),
+    })),
+  }
+}
+
+/* One recipient's activity: the send row plus every hit, newest first,
+   including the ones that were filtered out (flagged, so the UI can show them
+   dimmed). */
+export async function getSendEngagement(userId, campaignId, sendId) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(sendId))) throw new CampaignError('Send not found.', 404)
+  const { data: send, error } = await supabase
+    .from('campaign_sends')
+    .select('*')
+    .eq('id', sendId)
+    .eq('campaign_id', campaignId)
+    .eq('user_id', userId)
+    .maybeSingle()
+  if (error) throw error
+  if (!send) throw new CampaignError('Send not found.', 404)
+
+  const { data: events, error: evErr } = await supabase
+    .from('email_engagement_events')
+    .select('id, kind, url, counted, filter_reason, user_agent, from_email, snippet, occurred_at')
+    .eq('send_id', sendId)
+    .eq('user_id', userId)
+    .order('occurred_at', { ascending: false })
+    .limit(200)
+  if (evErr) throw evErr
+
+  return { send, events: events || [] }
 }

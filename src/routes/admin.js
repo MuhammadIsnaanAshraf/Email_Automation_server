@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { AdminError, listUsers, getUser, updateUserSendSettings, getSystemStats, getSystemLogs, listTemplates, getTemplate, listAdminLists, getListRecipients, listAdminCampaigns, countUpcomingCampaigns, getCampaignSends, listAllSends } from '../services/admin.js'
 import { SubscriptionError, listUsersWithSubscriptions, getSubscriptionHistory, activateSubscription, startTrial, setWhatsappNumber } from '../services/subscriptions.js'
 import { requireAuth, requireAdmin } from '../middleware/supabaseAuth.js'
+import { keyPoolStatus, resetKey } from '../lib/apify.js'
 
 const router = Router()
 
@@ -273,6 +274,28 @@ router.post('/subscriptions/:userId/start-trial', async (req, res, next) => {
     res.status(201).json({ payment })
   } catch (err) {
     if (err instanceof SubscriptionError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* GET /admin/lead-keys — health of each lead-source API key, in the order
+   they are tried. Fingerprints only; the tokens themselves never leave .env. */
+router.get('/lead-keys', async (_req, res, next) => {
+  try {
+    res.json({ keys: await keyPoolStatus() })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/* POST /admin/lead-keys/:fingerprint/reset — put a key back in rotation early,
+   e.g. after topping up its credit or fixing a mistyped token. */
+router.post('/lead-keys/:fingerprint/reset', async (req, res, next) => {
+  try {
+    if (!/^[0-9a-f]{16}$/.test(req.params.fingerprint)) return res.status(400).json({ error: 'invalid_fingerprint' })
+    await resetKey(req.params.fingerprint)
+    res.json({ keys: await keyPoolStatus() })
+  } catch (err) {
     next(err)
   }
 })

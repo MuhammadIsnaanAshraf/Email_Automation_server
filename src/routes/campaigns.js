@@ -19,6 +19,9 @@ import {
   cancelCampaign,
   getCampaignSends,
   getCampaignStats,
+  getCampaignEngagement,
+  getSendEngagement,
+  ENGAGEMENT_FILTERS,
 } from '../services/campaigns.js'
 
 const router = Router()
@@ -163,18 +166,43 @@ router.get('/:id/progress', async (req, res, next) => {
 })
 
 /* ── Paginated campaign sends (used by campaign detail page) ──
-   GET /campaigns/:id/sends?filter=all&search=&sort=scheduled_at&dir=asc&page=1&pageSize=50 */
+   GET /campaigns/:id/sends?filter=all&engagement=all&search=&sort=scheduled_at&dir=asc&page=1&pageSize=50
+   `engagement` = all | opened | clicked | replied | unopened — combines with
+   the status `filter`. */
 router.get('/:id/sends', async (req, res, next) => {
   try {
     const result = await getCampaignSends(req.user.id, req.params.id, {
       page: Math.max(1, parseInt(req.query.page, 10) || 1),
       pageSize: Math.min(500, Math.max(1, parseInt(req.query.pageSize, 10) || 50)),
       filter: req.query.filter || 'all',
+      engagement: ENGAGEMENT_FILTERS.has(req.query.engagement) ? req.query.engagement : 'all',
       search: req.query.search || '',
       sort: req.query.sort || 'scheduled_at',
       dir: req.query.dir || 'asc',
     })
     res.json(result)
+  } catch (err) {
+    if (err instanceof CampaignError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* ── Engagement report (opens / clicks / replies) ─────────────
+   GET /campaigns/:id/engagement */
+router.get('/:id/engagement', async (req, res, next) => {
+  try {
+    res.json(await getCampaignEngagement(req.user.id, req.params.id))
+  } catch (err) {
+    if (err instanceof CampaignError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* ── One recipient's activity timeline ────────────────────────
+   GET /campaigns/:id/sends/:sendId/events */
+router.get('/:id/sends/:sendId/events', async (req, res, next) => {
+  try {
+    res.json(await getSendEngagement(req.user.id, req.params.id, req.params.sendId))
   } catch (err) {
     if (err instanceof CampaignError) return res.status(err.status).json({ error: err.message })
     next(err)

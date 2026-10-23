@@ -17,6 +17,10 @@
 //      from this account, then hands the parsed facts to record_delivery_failure,
 //      which owns all counting and suppression.
 //
+// The same pass also detects REPLIES (step 4): inbound mail in the Gmail thread
+// of one of our sends. It runs after the bounce work with its own cursor and
+// its own error handling, so a reply-scan problem can never cost a bounce.
+//
 // What it will not do: conclude anything from a subject line, a sender address,
 // or the human-readable part of a notice. A message with no parseable report is
 // counted as unread and skipped. Suppression is permanent, so the bar for it is
@@ -29,10 +33,21 @@ import { refreshAccessToken, ConnectionError } from '../send-tick/gmail.ts'
 import { parseDsn, classify } from './dsn.ts'
 import {
   listBounceCandidates,
+  listMessages,
+  getMessageMetadata,
   getRawMessage,
   GmailReadError,
   GMAIL_READ_SCOPE,
 } from './gmailRead.ts'
+import {
+  buildReplyQuery,
+  isAutoReply,
+  isDeliveryNotice,
+  parseAddress,
+  pickSendForReply,
+  REPLY_METADATA_HEADERS,
+  type ThreadSend,
+} from './replies.ts'
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SERVICE_ROLE = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
@@ -70,6 +85,14 @@ const MAX_MESSAGES_PER_USER = Number(Deno.env.get('BOUNCE_MAX_MESSAGES_PER_USER'
 const MAX_USERS_PER_PASS = Number(Deno.env.get('BOUNCE_MAX_USERS_PER_PASS') ?? '25')
 const USER_CONCURRENCY = Number(Deno.env.get('BOUNCE_USER_CONCURRENCY') ?? '5')
 
+/* Reply detection. Listing is cheap (ids + thread ids, 100 per call) and is
+   matched against our sends locally, so only messages that really sit in one
+   of our threads cost a metadata fetch. */
+const REPLY_TRACKING_ENABLED = (Deno.env.get('REPLY_TRACKING_ENABLED') ?? 'true') !== 'false'
+const REPLY_MAX_LISTED_PER_USER = Number(Deno.env.get('REPLY_MAX_LISTED_PER_USER') ?? '500')
+const REPLY_MAX_FETCHED_PER_USER = Number(Deno.env.get('REPLY_MAX_FETCHED_PER_USER') ?? '100')
+const REPLY_INITIAL_LOOKBACK_DAYS = Number(Deno.env.get('REPLY_INITIAL_LOOKBACK_DAYS') ?? '7')
+
 console.log('[bounce-scan] module init; env present:', {
   SUPABASE_URL: !!SUPABASE_URL,
   SERVICE_ROLE: !!SERVICE_ROLE,
@@ -92,6 +115,8 @@ interface UserScanResult {
   duplicates: number
   suppressed: number
   unmatched: number
+  replies: number
+  autoReplies: number
   error?: string
 }
 
@@ -209,6 +234,8 @@ async function scanUser(userId: string): Promise<UserScanResult> {
     duplicates: 0,
     suppressed: 0,
     unmatched: 0,
+    replies: 0,
+    autoReplies: 0,
   }
 
   const { data: state } = await supabase
@@ -352,7 +379,111 @@ async function scanUser(userId: string): Promise<UserScanResult> {
   )
 
   await writeState(userId, passStartedAt, result)
+
+  // Bounce work is committed above; replies ride along on the same token.
+  if (REPLY_TRACKING_ENABLED) {
+    try {
+      const replies = await scanReplies(userId, accessToken)
+      result.replies = replies.replies
+      result.autoReplies = replies.autoReplies
+    } catch (err) {
+      console.error('[bounce-scan] reply scan failed:', userId, err)
+      await supabase
+        .from('bounce_scan_state')
+        .update({ replies_last_error: String(err).slice(0, 1000) })
+        .eq('user_id', userId)
+    }
+  }
   return result
+}
+
+// ── Replies ──────────────────────────────────────────────────
+async function sendsForThreads(userId: string, threadIds: string[]): Promise<Map<string, ThreadSend[]>> {
+  const byThread = new Map<string, ThreadSend[]>()
+  for (let i = 0; i < threadIds.length; i += 200) {
+    const { data, error } = await supabase
+      .from('campaign_sends')
+      .select('id, campaign_id, sent_at, gmail_thread_id')
+      .eq('user_id', userId)
+      .eq('status', 'sent')
+      .in('gmail_thread_id', threadIds.slice(i, i + 200))
+    if (error) throw error
+    for (const row of data || []) {
+      const list = byThread.get(row.gmail_thread_id) || []
+      list.push({ id: row.id, campaign_id: row.campaign_id, sent_at: row.sent_at })
+      byThread.set(row.gmail_thread_id, list)
+    }
+  }
+  return byThread
+}
+
+async function scanReplies(userId: string, accessToken: string): Promise<{ replies: number; autoReplies: number }> {
+  const out = { replies: 0, autoReplies: 0 }
+
+  const { data: state } = await supabase
+    .from('bounce_scan_state')
+    .select('replies_last_scanned_at')
+    .eq('user_id', userId)
+    .maybeSingle()
+
+  const cursor = state?.replies_last_scanned_at
+    ? new Date(state.replies_last_scanned_at).getTime() - SCAN_OVERLAP_MINUTES * 60_000
+    : Date.now() - REPLY_INITIAL_LOOKBACK_DAYS * 86400_000
+  const passStartedAt = new Date()
+
+  const refs = await listMessages(accessToken, buildReplyQuery(cursor / 1000), REPLY_MAX_LISTED_PER_USER)
+  if (refs.length >= REPLY_MAX_LISTED_PER_USER) {
+    console.warn('[bounce-scan] reply listing hit its cap; older messages in this window were not checked', {
+      userId,
+      cap: REPLY_MAX_LISTED_PER_USER,
+    })
+  }
+
+  const threads = await sendsForThreads(userId, [...new Set(refs.map((r) => r.threadId))])
+  const candidates = refs.filter((r) => threads.has(r.threadId)).slice(0, REPLY_MAX_FETCHED_PER_USER)
+
+  for (const ref of candidates) {
+    let meta
+    try {
+      meta = await getMessageMetadata(accessToken, ref.id, REPLY_METADATA_HEADERS)
+    } catch (err) {
+      console.warn('[bounce-scan] could not fetch reply metadata', ref.id, String(err))
+      continue
+    }
+    // Belt and braces for `-from:me`, and bounces live in the same thread.
+    if (meta.labelIds.includes('SENT') || meta.labelIds.includes('DRAFT')) continue
+    if (isDeliveryNotice(meta.headers)) continue
+
+    const send = pickSendForReply(threads.get(ref.threadId) || [], meta.internalDate)
+    if (!send) continue
+
+    const auto = isAutoReply(meta.headers)
+    const { data: outcome, error } = await supabase.rpc('record_engagement_event', {
+      p_send_id: send.id,
+      p_kind: 'reply',
+      p_filter_reason: auto ? 'auto_reply' : null,
+      p_occurred_at: new Date(meta.internalDate).toISOString(),
+      p_source_message_id: meta.id,
+      p_from_email: parseAddress(meta.headers['from']),
+      p_snippet: meta.snippet,
+    })
+    if (error) {
+      console.error('[bounce-scan] record_engagement_event (reply) failed:', error)
+      continue
+    }
+    if (outcome?.recorded) auto ? out.autoReplies++ : out.replies++
+  }
+
+  await supabase
+    .from('bounce_scan_state')
+    .update({
+      replies_last_scanned_at: passStartedAt.toISOString(),
+      replies_last_error: null,
+      replies_recorded: out.replies,
+    })
+    .eq('user_id', userId)
+
+  return out
 }
 
 async function writeState(userId: string, scannedThrough: Date | null, result: UserScanResult) {
@@ -472,6 +603,8 @@ Deno.serve(async (req) => {
           duplicates: 0,
           suppressed: 0,
           unmatched: 0,
+          replies: 0,
+          autoReplies: 0,
           error: String(err),
         }
       }
@@ -485,10 +618,12 @@ Deno.serve(async (req) => {
         duplicates: acc.duplicates + r.duplicates,
         suppressed: acc.suppressed + r.suppressed,
         unmatched: acc.unmatched + r.unmatched,
+        replies: acc.replies + r.replies,
+        autoReplies: acc.autoReplies + r.autoReplies,
         missingScope: acc.missingScope + (r.status === 'missing_scope' ? 1 : 0),
         errored: acc.errored + (r.status === 'error' ? 1 : 0),
       }),
-      { scanned: 0, parsed: 0, recorded: 0, duplicates: 0, suppressed: 0, unmatched: 0, missingScope: 0, errored: 0 }
+      { scanned: 0, parsed: 0, recorded: 0, duplicates: 0, suppressed: 0, unmatched: 0, replies: 0, autoReplies: 0, missingScope: 0, errored: 0 }
     )
 
     console.log('[bounce-scan] pass complete:', { users: userIds.length, ...totals, confirmed })

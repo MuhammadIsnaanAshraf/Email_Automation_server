@@ -74,22 +74,22 @@ export interface MessageRef {
   threadId: string
 }
 
-/* List candidate notices, newest first, following pagination up to `maxTotal`.
-   Gmail caps a page at 500; we ask for 100 so a pathological mailbox can't
-   stall one tick. */
-export async function listBounceCandidates(
+/* List message refs matching a Gmail search, newest first, following
+   pagination up to `maxTotal`. Gmail caps a page at 500; we ask for 100 so a
+   pathological mailbox can't stall one tick. */
+export async function listMessages(
   accessToken: string,
-  afterEpochSeconds: number,
+  query: string,
   maxTotal = 100
 ): Promise<MessageRef[]> {
-  const query = encodeURIComponent(buildBounceQuery(afterEpochSeconds))
+  const q = encodeURIComponent(query)
   const out: MessageRef[] = []
   let pageToken: string | undefined
 
   while (out.length < maxTotal) {
     const pageSize = Math.min(100, maxTotal - out.length)
     const path =
-      `/messages?q=${query}&maxResults=${pageSize}` +
+      `/messages?q=${q}&maxResults=${pageSize}` +
       (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '')
     const res = await gmailFetch(accessToken, path)
     const data = await res.json().catch(() => ({}))
@@ -102,6 +102,50 @@ export async function listBounceCandidates(
   }
 
   return out
+}
+
+/* List candidate failure notices, newest first. */
+export function listBounceCandidates(
+  accessToken: string,
+  afterEpochSeconds: number,
+  maxTotal = 100
+): Promise<MessageRef[]> {
+  return listMessages(accessToken, buildBounceQuery(afterEpochSeconds), maxTotal)
+}
+
+export interface MessageMetadata {
+  id: string
+  threadId: string
+  internalDate: number
+  labelIds: string[]
+  snippet: string
+  /** Lower-cased header name → first value. */
+  headers: Record<string, string>
+}
+
+/* Headers + snippet only (format=metadata) — enough to tell a reply from an
+   autoresponder or a bounce without downloading the body. */
+export async function getMessageMetadata(
+  accessToken: string,
+  id: string,
+  headerNames: string[]
+): Promise<MessageMetadata> {
+  const params = headerNames.map((h) => `&metadataHeaders=${encodeURIComponent(h)}`).join('')
+  const res = await gmailFetch(accessToken, `/messages/${id}?format=metadata${params}`)
+  const data = await res.json().catch(() => ({}))
+  const headers: Record<string, string> = {}
+  for (const h of (data.payload?.headers || []) as Array<{ name: string; value: string }>) {
+    const name = h.name?.toLowerCase()
+    if (name && !(name in headers)) headers[name] = h.value ?? ''
+  }
+  return {
+    id: data.id,
+    threadId: data.threadId,
+    internalDate: Number(data.internalDate) || Date.now(),
+    labelIds: data.labelIds || [],
+    snippet: data.snippet || '',
+    headers,
+  }
 }
 
 export interface RawMessage {

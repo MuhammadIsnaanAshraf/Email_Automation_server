@@ -8,3 +8,6 @@ project_id = "your-project-id"
 
 [functions.bounce-scan]
   verify_jwt = false
+
+[functions.track]
+  verify_jwt = false

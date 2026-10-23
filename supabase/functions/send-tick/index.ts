@@ -25,6 +25,13 @@ import { createClient } from 'npm:@supabase/supabase-js@2'
 import { decryptToken, encryptToken } from './crypto.ts'
 import { renderForRecipient } from './render.ts'
 import {
+  importTrackingKey,
+  resolveTrackingBaseUrl,
+  rewriteLinks,
+  injectOpenPixel,
+  type TrackingConfig,
+} from './tracking.ts'
+import {
   refreshAccessToken,
   sendEmail,
   fetchMessageId,
@@ -51,6 +58,11 @@ const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID')!
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET')!
 const TOKEN_ENCRYPTION_KEY = Deno.env.get('TOKEN_ENCRYPTION_KEY')!
 const TICK_SECRET = Deno.env.get('SEND_TICK_SECRET')!
+// Engagement tracking. Signing falls back to TOKEN_ENCRYPTION_KEY so no new
+// secret is required; the base URL defaults to this project's `track` function
+// and can point at a custom tracking domain instead (better for deliverability).
+const TRACKING_SECRET = Deno.env.get('TRACKING_SECRET') || TOKEN_ENCRYPTION_KEY
+const TRACKING_BASE_URL = resolveTrackingBaseUrl(Deno.env.get('TRACKING_BASE_URL'), SUPABASE_URL || '')
 
 // One send per account per tick (the tick itself runs once a minute).
 const MAX_PER_USER = Number(Deno.env.get('SEND_MAX_PER_USER_PER_PASS') ?? '1')
@@ -82,6 +94,41 @@ function initClient() {
   }
 }
 const supabase = initClient()
+
+let trackingConfig: Promise<TrackingConfig | null> | null = null
+function getTrackingConfig(): Promise<TrackingConfig | null> {
+  if (!trackingConfig) {
+    trackingConfig = TRACKING_SECRET
+      ? importTrackingKey(TRACKING_SECRET).then((key) => ({ baseUrl: TRACKING_BASE_URL, key }))
+      : Promise.resolve(null)
+  }
+  return trackingConfig
+}
+
+interface CampaignContent {
+  subject: string
+  body: string
+  track_opens: boolean
+  track_clicks: boolean
+}
+
+/* Add the open pixel / click redirects the campaign asked for. Tracking is a
+   nice-to-have layered on a send that must go out regardless, so any failure
+   here returns the untouched body instead of failing the send. */
+async function instrument(html: string, sendId: string, campaign: CampaignContent): Promise<string> {
+  if (!campaign.track_opens && !campaign.track_clicks) return html
+  try {
+    const cfg = await getTrackingConfig()
+    if (!cfg) return html
+    let out = html
+    if (campaign.track_clicks) out = await rewriteLinks(out, sendId, cfg)
+    if (campaign.track_opens) out = await injectOpenPixel(out, sendId, cfg)
+    return out
+  } catch (err) {
+    console.error('[send-tick] tracking instrumentation failed; sending untracked:', { sendId, err })
+    return html
+  }
+}
 
 interface Send {
   id: string
@@ -181,7 +228,7 @@ function startOfUtcDayISO(): string {
 async function processUserSend(
   userId: string,
   send: Send,
-  campaigns: Map<string, { subject: string; body: string }>,
+  campaigns: Map<string, CampaignContent>,
   user: { email: string; name: string | null; daily_send_limit: number | null }
 ) {
   const summary = { sent: 0, failed: 0, rescheduled: 0, deferred: 0, skipped: 0 }
@@ -305,7 +352,7 @@ async function processUserSend(
       cc: send.cc,
       bcc: send.bcc,
       subject,
-      html: body,
+      html: await instrument(body, send.id, campaign),
     })
 
     // Read back the Message-ID Gmail stamped on it. This is what lets a bounce
@@ -427,7 +474,10 @@ Deno.serve(async (req) => {
     console.log("🚀 ~ userIds:", userIds)
 
     const [{ data: campaignRows }, { data: profileRows }, { data: settingsRows }] = await Promise.all([
-      supabase.from('campaigns').select('id, subject, body').in('id', campaignIds),
+      // '*' rather than a column list: the tracking columns arrive with a
+      // migration, and naming them here would make every send fail as
+      // campaign_missing if this function were deployed before it ran.
+      supabase.from('campaigns').select('*').in('id', campaignIds),
       supabase.from('profiles').select('id, email, name').in('id', userIds),
       supabase.from('user_settings').select('user_id, daily_send_limit').in('user_id', userIds),
     ])
@@ -442,11 +492,13 @@ Deno.serve(async (req) => {
         s.daily_send_limit,
       ])
     )
-    const campaigns = new Map<string, { subject: string; body: string }>(
-      (campaignRows || []).map((c: { id: string; subject: string; body: string }) => [
-        c.id,
-        { subject: c.subject, body: c.body },
-      ])
+    const campaigns = new Map<string, CampaignContent>(
+      (campaignRows || []).map(
+        (c: { id: string; subject: string; body: string; track_opens?: boolean; track_clicks?: boolean }) => [
+          c.id,
+          { subject: c.subject, body: c.body, track_opens: !!c.track_opens, track_clicks: !!c.track_clicks },
+        ]
+      )
     )
     const users = new Map<string, { email: string; name: string | null; daily_send_limit: number }>()
     console.log("🚀 ~ users:", users)
