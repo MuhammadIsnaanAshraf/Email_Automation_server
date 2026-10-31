@@ -11,8 +11,15 @@ router.use(requireAuth)
    days since expiry, and their most recent payment's amount/method. */
 router.get('/me', async (req, res, next) => {
   try {
-    const status = await getSubscriptionStatus(req.user.id)
-    res.json(status)
+    // Inside an agency, what counts is the agency's subscription (it covers
+    // every account it manages) — unless the account pays for itself. Same
+    // rule as requireActiveSubscription, so the UI and the API agree.
+    const own = await getSubscriptionStatus(req.user.id)
+    if (req.agency && !own.active) {
+      const agency = await getSubscriptionStatus(req.agency.id)
+      return res.json({ ...agency, coveredByAgency: true })
+    }
+    res.json(own)
   } catch (err) {
     if (err instanceof SubscriptionError) return res.status(err.status).json({ error: err.message })
     next(err)

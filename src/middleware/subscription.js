@@ -8,7 +8,11 @@ export async function requireActiveSubscription(req, res, next) {
   try {
     if (req.user?.role === 'admin') return next()
 
-    const active = await hasActiveSubscription(req.user.id)
+    // An agency's subscription covers every account it manages; an account
+    // that also pays for itself is let through on its own subscription too.
+    const active =
+      (req.agency && (await hasActiveSubscription(req.agency.id))) ||
+      (await hasActiveSubscription(req.user.id))
     if (!active) {
       return res.status(402).json({
         error: 'subscription_required',

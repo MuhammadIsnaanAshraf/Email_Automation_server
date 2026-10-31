@@ -1,4 +1,5 @@
 import { supabase } from '../lib/supabase.js'
+import { resolveAgencyMember } from '../services/agencies.js'
 
 export async function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization
@@ -32,7 +33,40 @@ export async function requireAuth(req, res, next) {
   // created before this migration, or missing the field for any reason,
   // aren't accidentally locked out.
   req.user.status = user.app_metadata?.status || 'active'
+  // Only the service role can write app_metadata, so this can't be self-set.
+  // The agencies table remains the authority on whether it's approved.
+  req.user.accountType = user.app_metadata?.account_type === 'agency' ? 'agency' : 'user'
   req.accessToken = token
+
+  /* ── Agency working inside one of its accounts ──────────────
+     An agency login sends X-Account-Id to act as an attached account. If the
+     link checks out, req.user BECOMES that account for the rest of the
+     request — so every existing route, service and query (all scoped to
+     req.user.id) works unchanged — and the agency is kept on req.agency for
+     the few places that care (subscription, reconnect, /auth/me). The
+     account is always treated as a plain user: an agency can never pick up
+     admin rights through it. */
+  const actAs = req.headers['x-account-id']
+  if (actAs && actAs !== user.id) {
+    if (req.user.accountType !== 'agency') {
+      return res.status(403).json({ error: 'forbidden', code: 'not_agency' })
+    }
+    try {
+      const resolved = await resolveAgencyMember(user.id, String(actAs))
+      if (resolved.error) {
+        return res.status(403).json({ error: 'forbidden', code: resolved.error })
+      }
+      req.agency = { id: user.id, row: resolved.agency, user: req.user }
+      const member = resolved.member
+      req.user = member
+      req.user.role = 'user'
+      req.user.status = member.app_metadata?.status || 'active'
+      req.user.accountType = 'user'
+    } catch (err) {
+      return next(err)
+    }
+  }
+
   next()
 }
 

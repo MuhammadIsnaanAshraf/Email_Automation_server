@@ -3,6 +3,7 @@ import { AdminError, listUsers, getUser, updateUserSendSettings, getSystemStats,
 import { SubscriptionError, listUsersWithSubscriptions, getSubscriptionHistory, activateSubscription, startTrial, setWhatsappNumber } from '../services/subscriptions.js'
 import { requireAuth, requireAdmin } from '../middleware/supabaseAuth.js'
 import { keyPoolStatus, resetKey } from '../lib/apify.js'
+import { AgencyError, adminListAgencies, adminUpdateAgency, adminListAgencyMembers } from '../services/agencies.js'
 
 const router = Router()
 
@@ -296,6 +297,46 @@ router.post('/lead-keys/:fingerprint/reset', async (req, res, next) => {
     await resetKey(req.params.fingerprint)
     res.json({ keys: await keyPoolStatus() })
   } catch (err) {
+    next(err)
+  }
+})
+
+/* ── Agencies ─────────────────────────────────────────────────
+   GET /admin/agencies?status=pending|active|rejected|suspended|all&search=&page= */
+router.get('/agencies', async (req, res, next) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1)
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 50))
+    const search = typeof req.query.search === 'string' ? req.query.search.slice(0, 200) : ''
+    res.json(await adminListAgencies({ status: req.query.status || 'all', search, page, pageSize }))
+  } catch (err) {
+    if (err instanceof AgencyError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+/* PATCH /admin/agencies/:id  { status?, maxSubAccounts?, note? }
+   Approve ('active'), reject, suspend, or change the sub-account limit. */
+router.patch('/agencies/:id', async (req, res, next) => {
+  try {
+    res.json(
+      await adminUpdateAgency(
+        req.params.id,
+        { status: req.body?.status, maxSubAccounts: req.body?.maxSubAccounts, note: req.body?.note },
+        req.user.id
+      )
+    )
+  } catch (err) {
+    if (err instanceof AgencyError) return res.status(err.status).json({ error: err.message })
+    next(err)
+  }
+})
+
+router.get('/agencies/:id/accounts', async (req, res, next) => {
+  try {
+    res.json({ accounts: await adminListAgencyMembers(req.params.id) })
+  } catch (err) {
+    if (err instanceof AgencyError) return res.status(err.status).json({ error: err.message })
     next(err)
   }
 })

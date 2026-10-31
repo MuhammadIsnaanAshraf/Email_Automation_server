@@ -9,6 +9,7 @@ import {
   fetchItems,
   markExhausted,
 } from '../lib/apify.js'
+import { cleanEmail } from '../lib/emails.js'
 
 /* Lead finder: job titles + countries in, people out.
 
@@ -59,20 +60,6 @@ function cleanTerms(value, label) {
 }
 
 /* ── Mapping provider items → lead rows ──────────────────────── */
-
-/* Provider emails are sometimes built from a name with accents
-   ("jorge.yáñez@…"). Almost no mail server accepts that, while the plain-ASCII
-   form usually is the real mailbox, so transliterate — and count the result as
-   a guess. Anything still not a plain address is dropped rather than stored. */
-function cleanEmail(raw) {
-  if (!raw) return { email: null, altered: false }
-  const original = String(raw).trim().toLowerCase()
-  const email = original.normalize('NFD').replace(/[̀-ͯ]/g, '')
-  if (!/^[a-z0-9._%+'-]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$/.test(email)) {
-    return { email: null, altered: false }
-  }
-  return { email, altered: email !== original }
-}
 
 function text(value) {
   if (value == null) return null

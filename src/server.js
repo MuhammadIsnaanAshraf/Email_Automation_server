@@ -24,7 +24,11 @@ import subscriptionRoutes from './routes/subscriptions.js'
 import settingsRoutes from './routes/settings.js'
 import suppressionRoutes from './routes/suppressions.js'
 import leadRoutes from './routes/leads.js'
+import agencyRoutes from './routes/agency.js'
+import keepaliveRoutes from './routes/keepalive.js'
 import { resumeRunningSearches } from './services/leads.js'
+import creatorRoutes from './routes/creators.js'
+import { resumeRunningSearches as resumeCreatorSearches } from './services/creators.js'
 
 const app = express()
 
@@ -50,6 +54,7 @@ app.use(express.json())
 app.use(cookieParser())
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'zenviqo-backend' }))
+app.use('/keepalive', keepaliveRoutes)
 
 app.use('/auth', authRoutes)
 app.use('/lists', listRoutes)
@@ -60,6 +65,8 @@ app.use('/subscriptions', subscriptionRoutes)
 app.use('/settings', settingsRoutes)
 app.use('/suppressions', suppressionRoutes)
 app.use('/leads', leadRoutes)
+app.use('/creators', creatorRoutes)
+app.use('/agency', agencyRoutes)
 
 app.use((err, _req, res, _next) => {
   console.error('[error]', err)
@@ -71,4 +78,5 @@ app.listen(env.port, () => {
   // Lead searches run in this process; pick up any that were mid-flight when
   // it last stopped.
   resumeRunningSearches()
+  resumeCreatorSearches()
 })

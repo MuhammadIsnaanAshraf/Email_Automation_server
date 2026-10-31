@@ -10,6 +10,18 @@
    mechanism. */
 export function requireActiveAccount(req, res, next) {
   if (req.user?.role === 'admin') return next()
+  /* An agency login has no inbox of its own — the portal only makes sense
+     inside one of its attached accounts (X-Account-Id, resolved by
+     requireAuth into req.user). Without one there is nothing to show, and
+     letting it through would create lists/campaigns on the agency login
+     itself that no sender could ever deliver. */
+  if (req.user?.accountType === 'agency') {
+    return res.status(403).json({
+      error: 'select_account',
+      code: 'select_account',
+      message: 'Choose one of your accounts to continue.',
+    })
+  }
   if (req.user?.status === 'inactive') {
     return res.status(403).json({
       error: 'account_inactive',

@@ -151,8 +151,9 @@ async function markInvalid(token, reason) {
 
 /* Start the actor on the first usable key, falling through the pool on any
    key-specific failure. `skip` lets a caller exclude keys it already burned
-   during this search. Returns { fingerprint, runId, datasetId }. */
-export async function startRun(input, { skip = new Set() } = {}) {
+   during this search. `actorId` defaults to the lead-finder actor.
+   Returns { fingerprint, runId, datasetId }. */
+export async function startRun(input, { skip = new Set(), actorId = env.leads.actorId } = {}) {
   if (!isConfigured()) throw new PoolExhaustedError('APIFY_TOKENS is not configured')
 
   const candidates = (await usableTokens()).filter((t) => !skip.has(fingerprint(t)))
@@ -161,7 +162,7 @@ export async function startRun(input, { skip = new Set() } = {}) {
   for (const token of candidates) {
     const fp = fingerprint(token)
     try {
-      const json = await call(token, `/acts/${encodeURIComponent(env.leads.actorId)}/runs`, {
+      const json = await call(token, `/acts/${encodeURIComponent(actorId)}/runs`, {
         method: 'POST',
         body: input,
       })
@@ -223,6 +224,43 @@ export async function waitForRun(fp, runId, { maxMinutes = 60 } = {}) {
     }
   }
   throw new ApifyError(`run ${runId} still not finished after ${maxMinutes} minutes`, { kind: 'fatal' })
+}
+
+/* Run an actor to completion on the key pool, carrying on with the next key
+   whenever one runs out of credit part-way through.
+
+   `input` is a function (async ok) called before each attempt, so a retry can
+   ask only for what the previous attempt didn't get; returning null ends the
+   loop early. `onItems(items)` receives each finished run's items — including
+   a run that died of credit, whose items are already paid for. `onStart` sees
+   { fingerprint, runId } of every run so the caller can persist it, and
+   `resume` picks up such a run after a restart instead of starting a new one.
+   Returns the final run's { status, statusMessage }, or null when `input`
+   ended the loop before any run. */
+export async function runToCompletion(actorId, input, { resume = null, onStart, onItems, maxItems = 5000 } = {}) {
+  const burned = new Set()
+  let current = resume
+  let last = null
+
+  for (;;) {
+    if (!current) {
+      const body = await input()
+      if (!body) return last
+      const started = await startRun(body, { skip: burned, actorId })
+      current = { fingerprint: started.fingerprint, runId: started.runId }
+      if (onStart) await onStart(current)
+    }
+
+    const run = await waitForRun(current.fingerprint, current.runId)
+    const items = run.datasetId ? await fetchItems(current.fingerprint, run.datasetId, { limit: maxItems }) : []
+    if (onItems) await onItems(items)
+    last = { status: run.status, statusMessage: run.statusMessage }
+
+    if (!run.outOfCredit) return last
+    await markExhausted(run.token, run.statusMessage)
+    burned.add(current.fingerprint)
+    current = null
+  }
 }
 
 /* Every item in the run's dataset, paged. */

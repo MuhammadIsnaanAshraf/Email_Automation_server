@@ -57,6 +57,33 @@ export const env = {
     actorId: process.env.APIFY_LEADS_ACTOR_ID || 'T1XDXWc1L92AfIJtd',
     maxPerSearch: Math.max(1, Math.min(Number(process.env.LEADS_MAX_PER_SEARCH) || 500, 5000)),
   },
+
+  creators: {
+    // TikTok Shop creator discovery: market, keyword, sales (GMV).
+    discoveryActorId: process.env.APIFY_CREATORS_ACTOR_ID || 'lergassy~tiktok-shop-creators-scraper',
+    // Contact-email lookup by handle for creators discovery found without one.
+    emailActorId: process.env.APIFY_CREATOR_EMAIL_ACTOR_ID || 'sPFBcsiarHy9ykU2b',
+    // Ask discovery for the shop's own contact data (email etc.). Much pricier
+    // per row and not available on the free Apify plan; the email stage finds
+    // most addresses anyway.
+    discoveryWithContacts: process.env.CREATORS_DISCOVERY_WITH_CONTACTS === 'true',
+    maxPerKeyword: Math.max(1, Math.min(Number(process.env.CREATORS_MAX_PER_KEYWORD) || 100, 1000)),
+  },
+
+  agency: {
+    // Sub-account limit a newly signed-up agency starts with. Admins change it
+    // per agency afterwards (agencies.max_sub_accounts).
+    defaultMaxSubAccounts: Math.max(0, Math.min(Number(process.env.AGENCY_DEFAULT_MAX_SUB_ACCOUNTS) || 5, 1000)),
+  },
+
+  keepalive: {
+    // Per-IP throttle on the public GET /keepalive route. It exists only so an
+    // external daily cron keeps the Supabase project awake; these bounds leave
+    // plenty of room for that while stopping anyone who finds it from spamming
+    // the database.
+    windowMs: Math.max(1000, Number(process.env.KEEPALIVE_RATE_WINDOW_MS) || 60_000),
+    max: Math.max(1, Number(process.env.KEEPALIVE_RATE_MAX) || 10),
+  },
 }
 
 /* Keep any gap (env or per-user) inside the same sane window the DB check
